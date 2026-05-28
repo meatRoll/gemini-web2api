@@ -19,6 +19,7 @@ Convert Google Gemini's web interface into an OpenAI-compatible API. Zero authen
 - **Cross-Platform**: Pure Python, no dependencies beyond stdlib
 - **Streaming**: SSE streaming support
 - **Codex CLI**: Responses API (`/v1/responses`) for OpenAI Codex integration
+- **Gemini CLI**: Google native API (`/v1beta/models`) for Gemini CLI compatibility
 
 ## Quick Start
 
@@ -58,6 +59,19 @@ resp = client.chat.completions.create(
 )
 print(resp.choices[0].message.content)
 ```
+
+### Gemini CLI
+
+```bash
+export GEMINI_API_KEY=none
+export GOOGLE_GEMINI_BASE_URL=http://localhost:8081
+gemini
+```
+
+Supports Google native API endpoints:
+- `GET /v1beta/models` — list models
+- `POST /v1beta/models/{model}:generateContent` — non-streaming
+- `POST /v1beta/models/{model}:streamGenerateContent` — streaming (SSE)
 
 ## Available Models
 

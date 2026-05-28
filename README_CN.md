@@ -19,6 +19,7 @@
 - **跨平台**: 纯 Python, 无外部依赖
 - **流式输出**: SSE Streaming 支持
 - **Codex CLI**: Responses API (`/v1/responses`) 兼容 OpenAI Codex
+- **Gemini CLI**: Google 原生 API (`/v1beta/models`) 兼容 Gemini CLI
 
 ## 快速开始
 
@@ -58,6 +59,19 @@ resp = client.chat.completions.create(
 )
 print(resp.choices[0].message.content)
 ```
+
+### Gemini CLI
+
+```bash
+export GEMINI_API_KEY=none
+export GOOGLE_GEMINI_BASE_URL=http://localhost:8081
+gemini
+```
+
+支持 Google 原生 API 端点:
+- `GET /v1beta/models` — 模型列表
+- `POST /v1beta/models/{model}:generateContent` — 非流式生成
+- `POST /v1beta/models/{model}:streamGenerateContent` — 流式生成 (SSE)
 
 ## 可用模型
 
