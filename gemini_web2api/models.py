@@ -36,7 +36,10 @@ def resolve_model(model_name: str, default: str = "gemini-3.5-flash"):
     think_override = None
     if "@think=" in model_name:
         model_name, think_str = model_name.rsplit("@think=", 1)
-        think_override = int(think_str)
+        try:
+            think_override = int(think_str)
+        except ValueError:
+            return None, None, None, f"Invalid think level: {think_str}"
     cfg = MODELS.get(model_name)
     if not cfg:
         return None, None, None, f"Unknown model: {model_name}"

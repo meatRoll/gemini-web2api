@@ -8,7 +8,6 @@ import urllib.parse
 import ssl
 import os
 import hashlib
-import base64
 
 try:
     import httpx
@@ -18,6 +17,10 @@ except ImportError:
 
 from .config import CONFIG
 
+_ssl_ctx = None
+_cookie_cache = {"str": "", "sapisid": None, "mtime": 0}
+_httpx_client = None
+
 
 def log(msg: str):
     if CONFIG["log_requests"]:
@@ -26,12 +29,31 @@ def log(msg: str):
         sys.stderr.flush()
 
 
+def _get_ssl_ctx():
+    global _ssl_ctx
+    if _ssl_ctx is None:
+        _ssl_ctx = ssl.create_default_context()
+    return _ssl_ctx
+
+
+def _get_httpx_client():
+    global _httpx_client
+    if _httpx_client is None and HAS_HTTPX:
+        proxy = CONFIG.get("proxy")
+        transport = httpx.HTTPTransport(proxy=proxy) if proxy else None
+        _httpx_client = httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True)
+    return _httpx_client
+
+
 def load_cookie() -> tuple:
-    """Load cookie from file. Returns (cookie_str, sapisid)."""
+    """Load cookie from file with mtime-based caching."""
     cookie_file = CONFIG.get("cookie_file")
     if not cookie_file or not os.path.exists(cookie_file):
         return "", None
     try:
+        mtime = os.path.getmtime(cookie_file)
+        if mtime == _cookie_cache["mtime"] and _cookie_cache["str"]:
+            return _cookie_cache["str"], _cookie_cache["sapisid"]
         with open(cookie_file, "r") as f:
             content = f.read().strip()
         if content.startswith("{"):
@@ -42,10 +64,11 @@ def load_cookie() -> tuple:
             cookie_str = content
             pairs = dict(p.split("=", 1) for p in cookie_str.split("; ") if "=" in p)
             sapisid = pairs.get("SAPISID", "")
+        _cookie_cache.update({"str": cookie_str, "sapisid": sapisid or None, "mtime": mtime})
         return cookie_str, sapisid if sapisid else None
     except Exception as e:
         log(f"Cookie load error: {e}")
-        return "", None
+        return _cookie_cache["str"], _cookie_cache["sapisid"]
 
 
 def make_sapisidhash(sapisid: str) -> str:
@@ -71,7 +94,6 @@ def _build_headers() -> dict:
 
 
 def _build_payload(prompt: str, model_id: int, think_mode: int, image_b64: str = None) -> str:
-    """Build StreamGenerate request payload."""
     inner = [None] * 80
     inner[0] = [prompt, 0, None, None, None, None, 0]
     inner[1] = ["en"]
@@ -90,10 +112,7 @@ def _build_payload(prompt: str, model_id: int, think_mode: int, image_b64: str =
     inner[61] = []
     inner[68] = 1
     inner[79] = model_id
-
-    if image_b64:
-        inner[12] = [[["data:image/jpeg;base64," + image_b64, 1]]]
-
+    # Note: multimodal image support requires separate upload API (not yet implemented)
     outer = [None, json.dumps(inner)]
     return urllib.parse.urlencode({"f.req": json.dumps(outer)})
 
@@ -108,55 +127,57 @@ def _get_url() -> str:
 
 
 def clean_text(text: str) -> str:
-    """Remove internal code execution artifacts."""
-    text = re.sub(
+    return re.sub(
         r'```(?:python|javascript|text)\?code_(?:reference|stdout)&code_event_index=\d+\n.*?```\n?',
         '', text, flags=re.DOTALL
-    )
-    return text.strip()
+    ).strip()
+
+
+def _extract_texts_from_line(line: str) -> list:
+    """Parse a single wrb.fr line and return list of text strings found."""
+    if '"wrb.fr"' not in line or len(line) < 200:
+        return []
+    try:
+        arr = json.loads(line)
+        inner_str = arr[0][2]
+        if not inner_str or len(inner_str) < 50:
+            return []
+        inner = json.loads(inner_str)
+        if not (isinstance(inner, list) and len(inner) > 4 and inner[4]):
+            return []
+        texts = []
+        for part in inner[4]:
+            if isinstance(part, list) and len(part) > 1 and part[1] and isinstance(part[1], list):
+                for t in part[1]:
+                    if isinstance(t, str) and t:
+                        texts.append(t)
+        return texts
+    except (json.JSONDecodeError, IndexError, TypeError):
+        return []
 
 
 def extract_response_text(raw: str) -> str:
-    """Parse StreamGenerate response to extract final text."""
-    texts = []
+    """Parse full response to get final text."""
+    last_text = ""
     for line in raw.split("\n"):
-        if '"wrb.fr"' not in line or len(line) < 200:
-            continue
-        try:
-            arr = json.loads(line)
-            inner_str = arr[0][2]
-            if not inner_str or len(inner_str) < 50:
-                continue
-            inner = json.loads(inner_str)
-            if isinstance(inner, list) and len(inner) > 4 and inner[4]:
-                for part in inner[4]:
-                    if isinstance(part, list) and len(part) > 1 and part[1]:
-                        if isinstance(part[1], list):
-                            for t in part[1]:
-                                if isinstance(t, str) and len(t) > 0:
-                                    texts.append(t)
-        except (json.JSONDecodeError, IndexError, TypeError):
-            pass
-    text = ""
-    for t in reversed(texts):
-        if t.strip():
-            text = t
-            break
-    return clean_text(text)
+        for t in _extract_texts_from_line(line):
+            if len(t) > len(last_text):
+                last_text = t
+    return clean_text(last_text)
 
 
 def generate(prompt: str, model_id: int, think_mode: int, image_b64: str = None) -> str:
-    """Non-streaming: send and return full text response."""
+    """Non-streaming generation with retry."""
     body = _build_payload(prompt, model_id, think_mode, image_b64).encode()
     url = _get_url()
     headers = _build_headers()
+    ctx = _get_ssl_ctx()
+    proxy = CONFIG.get("proxy")
 
     last_err = None
     for attempt in range(CONFIG["retry_attempts"]):
         try:
             req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-            ctx = ssl.create_default_context()
-            proxy = CONFIG.get("proxy")
             if proxy:
                 opener = urllib.request.build_opener(
                     urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
@@ -176,44 +197,38 @@ def generate(prompt: str, model_id: int, think_mode: int, image_b64: str = None)
 
 
 def generate_stream(prompt: str, model_id: int, think_mode: int, image_b64: str = None):
-    """Streaming: yield incremental text deltas via httpx."""
-    body = _build_payload(prompt, model_id, think_mode, image_b64)
-    url = _get_url()
-    headers = _build_headers()
-    proxy = CONFIG.get("proxy")
-
+    """Streaming generation via httpx with retry on connection failure."""
     if not HAS_HTTPX:
         text = generate(prompt, model_id, think_mode, image_b64)
         if text:
             yield text
         return
 
-    prev_text = ""
-    transport = httpx.HTTPTransport(proxy=proxy) if proxy else None
-    with httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True) as client:
-        with client.stream("POST", url, content=body, headers=headers) as resp:
-            buf = ""
-            for chunk in resp.iter_text():
-                buf += chunk
-                while "\n" in buf:
-                    line, buf = buf.split("\n", 1)
-                    if '"wrb.fr"' not in line or len(line) < 200:
-                        continue
-                    try:
-                        arr = json.loads(line)
-                        inner_str = arr[0][2]
-                        if not inner_str or len(inner_str) < 50:
-                            continue
-                        inner2 = json.loads(inner_str)
-                        if isinstance(inner2, list) and len(inner2) > 4 and inner2[4]:
-                            for part in inner2[4]:
-                                if isinstance(part, list) and len(part) > 1 and part[1] and isinstance(part[1], list):
-                                    for t in part[1]:
-                                        if isinstance(t, str) and len(t) > len(prev_text):
-                                            delta = t[len(prev_text):]
-                                            delta = clean_text(delta)
-                                            if delta:
-                                                yield delta
-                                            prev_text = t
-                    except (json.JSONDecodeError, IndexError, TypeError):
-                        pass
+    body = _build_payload(prompt, model_id, think_mode, image_b64)
+    url = _get_url()
+    headers = _build_headers()
+    client = _get_httpx_client()
+
+    last_err = None
+    for attempt in range(CONFIG["retry_attempts"]):
+        try:
+            prev_text = ""
+            with client.stream("POST", url, content=body, headers=headers) as resp:
+                buf = ""
+                for chunk in resp.iter_text():
+                    buf += chunk
+                    while "\n" in buf:
+                        line, buf = buf.split("\n", 1)
+                        for t in _extract_texts_from_line(line):
+                            if len(t) > len(prev_text):
+                                delta = clean_text(t[len(prev_text):])
+                                if delta:
+                                    yield delta
+                                prev_text = t
+            return
+        except Exception as e:
+            last_err = e
+            if attempt < CONFIG["retry_attempts"] - 1:
+                log(f"Stream retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
+                time.sleep(CONFIG["retry_delay_sec"])
+    raise last_err

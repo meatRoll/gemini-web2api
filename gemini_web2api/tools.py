@@ -76,9 +76,13 @@ def parse_tool_calls(text: str) -> tuple:
     """Extract tool_call blocks. Returns (clean_text, tool_calls_list)."""
     tool_calls = []
     pattern = r'```tool_call\s*\n(.*?)\n```'
-    for match in re.findall(pattern, text, re.DOTALL):
+    clean_parts = []
+    last_end = 0
+    for m in re.finditer(pattern, text, re.DOTALL):
+        clean_parts.append(text[last_end:m.start()])
+        last_end = m.end()
         try:
-            data = json.loads(match.strip())
+            data = json.loads(m.group(1).strip())
             tool_calls.append({
                 "id": f"call_{uuid.uuid4().hex[:8]}",
                 "type": "function",
@@ -89,7 +93,8 @@ def parse_tool_calls(text: str) -> tuple:
             })
         except (json.JSONDecodeError, KeyError):
             pass
-    clean = re.sub(pattern, '', text, flags=re.DOTALL).strip()
+    clean_parts.append(text[last_end:])
+    clean = "".join(clean_parts).strip()
     return clean, tool_calls
 
 

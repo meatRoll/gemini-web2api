@@ -3,7 +3,6 @@ import json
 import time
 import uuid
 import re
-import sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
@@ -12,6 +11,12 @@ from .models import MODELS, resolve_model
 from .gemini import generate, generate_stream, log
 from .tools import messages_to_prompt, parse_tool_calls
 from . import __version__
+
+
+def _usage(prompt: str, text: str) -> dict:
+    p = len(prompt) // 4
+    c = len(text or "") // 4
+    return {"prompt_tokens": p, "completion_tokens": c, "total_tokens": p + c}
 
 
 class GeminiHandler(BaseHTTPRequestHandler):
@@ -26,6 +31,19 @@ class GeminiHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _start_sse(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+
+    def _parse_body(self, body: bytes) -> dict:
+        try:
+            return json.loads(body)
+        except (json.JSONDecodeError, ValueError):
+            return None
 
     def _authorized(self):
         keys = CONFIG.get("api_keys") or []
@@ -95,7 +113,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
     # ─── /v1/chat/completions ─────────────────────────────────────────────────
 
     def _handle_chat(self, body: bytes):
-        req = json.loads(body)
+        req = self._parse_body(body)
+        if req is None:
+            self.send_json({"error": {"message": "invalid JSON"}}, 400)
+            return
         model_name, model_id, think_mode, err = resolve_model(
             req.get("model", CONFIG["default_model"]))
         if err:
@@ -113,11 +134,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         if stream and not tools:
             try:
-                self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream")
-                self.send_header("Cache-Control", "no-cache")
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.end_headers()
+                self._start_sse()
                 for delta in generate_stream(prompt, model_id, think_mode, image_b64):
                     chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                              "model": model_name, "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}]}
@@ -147,11 +164,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         finish = "tool_calls" if tool_calls else "stop"
 
         if stream:
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
+            self._start_sse()
             chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                      "model": model_name, "choices": [{"index": 0, "delta": msg, "finish_reason": finish}]}
             self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
@@ -169,7 +182,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
     # ─── /v1/responses (Codex CLI) ───────────────────────────────────────────
 
     def _handle_responses(self, body: bytes):
-        req = json.loads(body)
+        req = self._parse_body(body)
+        if req is None:
+            self.send_json({"error": {"message": "invalid JSON"}}, 400)
+            return
         model_name, model_id, think_mode, err = resolve_model(
             req.get("model", CONFIG["default_model"]))
         if err:
@@ -272,7 +288,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
     # ─── /v1beta/models (Google Gemini CLI) ──────────────────────────────────
 
     def _handle_google_generate(self, body: bytes, stream: bool):
-        req = json.loads(body)
+        req = self._parse_body(body)
+        if req is None:
+            self.send_json({"error": {"message": "invalid JSON"}}, 400)
+            return
         m = re.match(r'/v1beta/models/([^:?]+)', self.path)
         model_name = m.group(1) if m else CONFIG["default_model"]
         model_name, model_id, think_mode, err = resolve_model(model_name)
