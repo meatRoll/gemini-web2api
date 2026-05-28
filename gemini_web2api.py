@@ -6,11 +6,19 @@ Converts Google Gemini's web interface into an OpenAI-compatible API server.
 Zero authentication required. Works on any platform (Windows/macOS/Linux).
 
 Usage:
+    pip install httpx
     python gemini_web2api.py [--port 8081] [--config config.json]
 
 Client configuration (Cherry Studio, ChatBox, etc.):
     Base URL: http://localhost:8081/v1
-    API Key: config.api_keys item, or anything if api_keys is empty
+    API Key: (anything or empty)
+
+How it works:
+    Sends requests directly to Gemini's public StreamGenerate endpoint.
+    The backend does not verify authentication for basic text generation.
+    Model selection via MODE_CATEGORY field [79] in the request payload.
+    This is NOT a user-tier spoofing attack - the endpoint simply doesn't
+    require auth for anonymous access.
 """
 import json
 import urllib.request
@@ -23,10 +31,17 @@ import re
 import os
 import hashlib
 import argparse
+import base64
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
-__version__ = "1.0.0"
+try:
+    import httpx
+    HAS_HTTPX = True
+except ImportError:
+    HAS_HTTPX = False
+
+__version__ = "1.1.0"
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 
@@ -38,7 +53,6 @@ DEFAULT_CONFIG = {
     "request_timeout_sec": 180,
     "gemini_bl": "boq_assistant-bard-web-server_20260525.09_p0",
     "default_model": "gemini-3.5-flash",
-    "api_keys": [],
     "log_requests": True,
     "cookie_file": None,
     "proxy": None,
@@ -183,6 +197,89 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int) -> str:
     raise last_err
 
 
+def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int):
+    """Send prompt and yield incremental text deltas using httpx streaming."""
+    inner = [None] * 80
+    inner[0] = [prompt, 0, None, None, None, None, 0]
+    inner[1] = ["en"]
+    inner[2] = ["", "", "", None, None, None, None, None, None, ""]
+    inner[6] = [0]
+    inner[7] = 1
+    inner[10] = 1
+    inner[11] = 0
+    inner[17] = [[think_mode]]
+    inner[18] = 0
+    inner[27] = 1
+    inner[30] = [4]
+    inner[41] = [2]
+    inner[53] = 0
+    inner[59] = str(uuid.uuid4())
+    inner[61] = []
+    inner[68] = 1
+    inner[79] = model_id
+
+    outer = [None, json.dumps(inner)]
+    body = urllib.parse.urlencode({"f.req": json.dumps(outer)})
+    reqid = int(time.time()) % 1000000
+    url = (
+        "https://gemini.google.com/_/BardChatUi/data/"
+        "assistant.lamda.BardFrontendService/StreamGenerate"
+        f"?bl={CONFIG['gemini_bl']}&hl=en&_reqid={reqid}&rt=c"
+    )
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Origin": "https://gemini.google.com",
+        "Referer": "https://gemini.google.com/app",
+        "X-Same-Domain": "1",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    }
+    cookie_str, sapisid = load_cookie()
+    if cookie_str:
+        headers["Cookie"] = cookie_str
+    if sapisid:
+        headers["Authorization"] = make_sapisidhash(sapisid)
+
+    proxy = CONFIG.get("proxy")
+
+    if not HAS_HTTPX:
+        # Fallback: non-streaming with urllib
+        raw = gemini_stream_generate(prompt, model_id, think_mode)
+        text = extract_response_text(raw)
+        if text:
+            yield text
+        return
+
+    prev_text = ""
+    transport = httpx.HTTPTransport(proxy=proxy) if proxy else None
+    with httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True) as client:
+        with client.stream("POST", url, content=body, headers=headers) as resp:
+            buf = ""
+            for chunk in resp.iter_text():
+                buf += chunk
+                while "\n" in buf:
+                    line, buf = buf.split("\n", 1)
+                    if '"wrb.fr"' not in line or len(line) < 200:
+                        continue
+                    try:
+                        arr = json.loads(line)
+                        inner_str = arr[0][2]
+                        if not inner_str or len(inner_str) < 50:
+                            continue
+                        inner2 = json.loads(inner_str)
+                        if isinstance(inner2, list) and len(inner2) > 4 and inner2[4]:
+                            for part in inner2[4]:
+                                if isinstance(part, list) and len(part) > 1 and part[1] and isinstance(part[1], list):
+                                    for t in part[1]:
+                                        if isinstance(t, str) and len(t) > len(prev_text):
+                                            delta = t[len(prev_text):]
+                                            delta = clean_gemini_text(delta)
+                                            if delta:
+                                                yield delta
+                                            prev_text = t
+                    except (json.JSONDecodeError, IndexError, TypeError):
+                        pass
+
+
 def clean_gemini_text(text: str) -> str:
     """Remove internal code execution artifacts."""
     text = re.sub(
@@ -308,20 +405,6 @@ class GeminiHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _authorized(self):
-        keys = CONFIG.get("api_keys") or []
-        if not keys:
-            return True
-        auth = self.headers.get("Authorization", "")
-        key = auth[7:] if auth.startswith("Bearer ") else self.headers.get("x-api-key", "")
-        return key in keys
-
-    def _require_auth(self):
-        if self._authorized():
-            return True
-        self.send_json({"error": {"message": "invalid api key"}}, 401)
-        return False
-
     def do_OPTIONS(self):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -331,8 +414,6 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         try:
-            if self.path.startswith("/v1/") and not self._require_auth():
-                return
             if self.path == "/v1/models":
                 self.send_json({"object": "list", "data": [
                     {"id": n, "object": "model", "created": 1700000000,
@@ -353,8 +434,6 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
-            if self.path.startswith("/v1/") and not self._require_auth():
-                return
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length) if length else b""
             if self.path == "/v1/chat/completions":
@@ -408,19 +487,48 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": "empty prompt"}}, 400)
             return
 
+        stream = req.get("stream", False)
+        cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+
+        if stream and not tools:
+            # True streaming: forward chunks as they arrive
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                for delta_text in gemini_stream_generate_iter(prompt, model_id, think_mode):
+                    chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
+                             "model": model_name, "choices": [{"index": 0, "delta": {"content": delta_text}, "finish_reason": None}]}
+                    self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
+                    self.wfile.flush()
+                # Final chunk
+                chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
+                         "model": model_name, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+                self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            except Exception as e:
+                log(f"Stream error: {e}")
+            return
+
+        # Non-streaming (or tool calling which needs full response)
         try:
             text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
 
-        cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         msg = {"role": "assistant", "content": text or None}
         if tool_calls:
             msg["tool_calls"] = tool_calls
         finish = "tool_calls" if tool_calls else "stop"
 
-        if req.get("stream"):
+        if stream:
+            # Stream mode with tools: send as single chunk (need full parse for tool_calls)
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
@@ -428,7 +536,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.end_headers()
             chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                      "model": model_name, "choices": [{"index": 0, "delta": msg, "finish_reason": finish}]}
-            self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
+            self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
         else:
