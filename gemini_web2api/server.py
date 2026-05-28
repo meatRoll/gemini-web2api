@@ -10,6 +10,7 @@ from .config import CONFIG
 from .models import MODELS, resolve_model
 from .gemini import generate, generate_stream, log
 from .tools import messages_to_prompt, parse_tool_calls
+from .multimodal import upload_image, fetch_image_bytes
 from . import __version__
 
 
@@ -17,6 +18,26 @@ def _usage(prompt: str, text: str) -> dict:
     p = len(prompt) // 4
     c = len(text or "") // 4
     return {"prompt_tokens": p, "completion_tokens": c, "total_tokens": p + c}
+
+
+def _upload_images(images: list) -> list:
+    """Upload images and return list of file references. Returns None if no images."""
+    if not images:
+        return None
+    file_refs = []
+    for item in images:
+        try:
+            if isinstance(item, tuple) and len(item) == 2:
+                data, mime = item
+                if isinstance(data, str):
+                    data = fetch_image_bytes(data)
+                    mime = mime or "image/png"
+                if data:
+                    ref = upload_image(data, "image.png", mime or "image/png")
+                    file_refs.append(ref)
+        except Exception as e:
+            log(f"Image upload failed: {e}")
+    return file_refs if file_refs else None
 
 
 class GeminiHandler(BaseHTTPRequestHandler):
@@ -124,7 +145,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         tools = req.get("tools")
-        prompt, image_b64 = messages_to_prompt(req.get("messages", []), tools)
+        prompt, images = messages_to_prompt(req.get("messages", []), tools)
         if not prompt.strip():
             self.send_json({"error": {"message": "empty prompt"}}, 400)
             return
@@ -135,7 +156,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         if stream and not tools:
             try:
                 self._start_sse()
-                for delta in generate_stream(prompt, model_id, think_mode, image_b64):
+                for delta in generate_stream(prompt, model_id, think_mode, _upload_images(images)):
                     chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                              "model": model_name, "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}]}
                     self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
@@ -150,7 +171,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            text = generate(prompt, model_id, think_mode, image_b64)
+            text = generate(prompt, model_id, think_mode, _upload_images(images))
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
@@ -234,13 +255,13 @@ class GeminiHandler(BaseHTTPRequestHandler):
             tools = [{"type": "function", "function": {"name": t["name"], "description": t.get("description", ""), "parameters": t.get("parameters", {})}}
                      if t.get("type") == "function" and "function" not in t else t for t in tools]
 
-        prompt, image_b64 = messages_to_prompt(messages, tools)
+        prompt, images = messages_to_prompt(messages, tools)
         if not prompt.strip():
             self.send_json({"error": {"message": "empty input"}}, 400)
             return
 
         try:
-            text = generate(prompt, model_id, think_mode, image_b64)
+            text = generate(prompt, model_id, think_mode, _upload_images(images))
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return

@@ -93,9 +93,13 @@ def _build_headers() -> dict:
     return headers
 
 
-def _build_payload(prompt: str, model_id: int, think_mode: int, image_b64: str = None) -> str:
+def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list = None) -> str:
     inner = [None] * 80
-    inner[0] = [prompt, 0, None, None, None, None, 0]
+    if file_refs:
+        refs = [[None, None, ref] for ref in file_refs]
+        inner[0] = [prompt, 0, None, refs, None, None, 0]
+    else:
+        inner[0] = [prompt, 0, None, None, None, None, 0]
     inner[1] = ["en"]
     inner[2] = ["", "", "", None, None, None, None, None, None, ""]
     inner[6] = [0]
@@ -112,7 +116,6 @@ def _build_payload(prompt: str, model_id: int, think_mode: int, image_b64: str =
     inner[61] = []
     inner[68] = 1
     inner[79] = model_id
-    # Note: multimodal image support requires separate upload API (not yet implemented)
     outer = [None, json.dumps(inner)]
     return urllib.parse.urlencode({"f.req": json.dumps(outer)})
 
@@ -166,9 +169,9 @@ def extract_response_text(raw: str) -> str:
     return clean_text(last_text)
 
 
-def generate(prompt: str, model_id: int, think_mode: int, image_b64: str = None) -> str:
+def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None) -> str:
     """Non-streaming generation with retry."""
-    body = _build_payload(prompt, model_id, think_mode, image_b64).encode()
+    body = _build_payload(prompt, model_id, think_mode, file_refs).encode()
     url = _get_url()
     headers = _build_headers()
     ctx = _get_ssl_ctx()
@@ -196,15 +199,15 @@ def generate(prompt: str, model_id: int, think_mode: int, image_b64: str = None)
     raise last_err
 
 
-def generate_stream(prompt: str, model_id: int, think_mode: int, image_b64: str = None):
+def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list = None):
     """Streaming generation via httpx with retry on connection failure."""
     if not HAS_HTTPX:
-        text = generate(prompt, model_id, think_mode, image_b64)
+        text = generate(prompt, model_id, think_mode, file_refs)
         if text:
             yield text
         return
 
-    body = _build_payload(prompt, model_id, think_mode, image_b64)
+    body = _build_payload(prompt, model_id, think_mode, file_refs)
     url = _get_url()
     headers = _build_headers()
     client = _get_httpx_client()

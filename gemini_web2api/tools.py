@@ -6,9 +6,12 @@ import base64
 
 
 def messages_to_prompt(messages: list, tools: list = None) -> tuple:
-    """Convert OpenAI messages to (prompt_str, image_b64_or_None)."""
+    """Convert OpenAI messages to (prompt_str, images_list).
+
+    Returns (prompt, images) where images is a list of (bytes, mime_type) tuples.
+    """
     parts = []
-    image_b64 = None
+    images = []
 
     if tools:
         tool_defs = []
@@ -35,18 +38,23 @@ def messages_to_prompt(messages: list, tools: list = None) -> tuple:
         if isinstance(content, list):
             text_parts = []
             for c in content:
-                if c.get("type") == "text" or c.get("type") == "input_text":
+                if c.get("type") in ("text", "input_text"):
                     text_parts.append(c.get("text", ""))
                 elif c.get("type") == "image_url":
                     url = c.get("image_url", {}).get("url", "")
                     if url.startswith("data:"):
-                        b64 = url.split(",", 1)[1] if "," in url else ""
-                        image_b64 = b64
+                        header, b64 = url.split(",", 1) if "," in url else ("", "")
+                        mime = "image/png"
+                        if ":" in header:
+                            mime = header.split(";")[0].split(":")[1]
+                        images.append((base64.b64decode(b64), mime))
                     else:
-                        image_b64 = _fetch_image_as_b64(url)
+                        images.append((url, None))
                 elif c.get("type") == "image":
-                    if c.get("source", {}).get("type") == "base64":
-                        image_b64 = c["source"]["data"]
+                    src = c.get("source", {})
+                    if src.get("type") == "base64":
+                        mime = src.get("media_type", "image/png")
+                        images.append((base64.b64decode(src["data"]), mime))
             content = " ".join(text_parts)
 
         if role == "system":
@@ -69,7 +77,7 @@ def messages_to_prompt(messages: list, tools: list = None) -> tuple:
             parts.append(content if content else "")
 
     prompt = "\n\n".join(p for p in parts if p)
-    return prompt, image_b64
+    return prompt, images
 
 
 def parse_tool_calls(text: str) -> tuple:
@@ -96,13 +104,3 @@ def parse_tool_calls(text: str) -> tuple:
     clean_parts.append(text[last_end:])
     clean = "".join(clean_parts).strip()
     return clean, tool_calls
-
-
-def _fetch_image_as_b64(url: str) -> str:
-    """Fetch image URL and return base64."""
-    try:
-        import urllib.request
-        resp = urllib.request.urlopen(url, timeout=30)
-        return base64.b64encode(resp.read()).decode()
-    except Exception:
-        return ""
