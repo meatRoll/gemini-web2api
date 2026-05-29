@@ -130,10 +130,12 @@ def _get_url() -> str:
 
 
 def clean_text(text: str) -> str:
-    return re.sub(
+    text = re.sub(
         r'```(?:python|javascript|text)\?code_(?:reference|stdout)&code_event_index=\d+\n.*?```\n?',
         '', text, flags=re.DOTALL
-    ).strip()
+    )
+    text = re.sub(r'http://googleusercontent\.com/card_content/\d+\n?', '', text)
+    return text.strip()
 
 
 def _extract_texts_from_line(line: str) -> list:

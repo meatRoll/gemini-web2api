@@ -32,7 +32,11 @@ MODELS = {
 
 
 def resolve_model(model_name: str, default: str = "gemini-3.5-flash"):
-    """Resolve model name to (name, mode_id, think_mode, error)."""
+    """Resolve model name to (name, mode_id, think_mode, error).
+
+    Unknown model names fall back to default rather than erroring,
+    since upstream clients may request arbitrary model identifiers.
+    """
     think_override = None
     if "@think=" in model_name:
         model_name, think_str = model_name.rsplit("@think=", 1)
@@ -42,7 +46,10 @@ def resolve_model(model_name: str, default: str = "gemini-3.5-flash"):
             return None, None, None, f"Invalid think level: {think_str}"
     cfg = MODELS.get(model_name)
     if not cfg:
-        return None, None, None, f"Unknown model: {model_name}"
+        from .gemini import log
+        log(f"Unknown model '{model_name}', falling back to '{default}'")
+        model_name = default
+        cfg = MODELS[default]
     mode_id = cfg["mode"]
     think_mode = think_override if think_override is not None else cfg["think"]
     return model_name, mode_id, think_mode, None
