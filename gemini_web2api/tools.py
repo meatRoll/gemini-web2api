@@ -5,7 +5,27 @@ import uuid
 import base64
 
 
-def messages_to_prompt(messages: list, tools: list = None) -> tuple:
+def _build_tool_choice_instruction(tool_choice, tool_defs: list) -> str:
+    """Build tool_choice constraint instruction.
+
+    tool_choice values:
+      - "none": do not call any tool
+      - "auto": decide whether to call tools (default)
+      - "required": must call at least one tool
+      - {"type": "function", "function": {"name": "xxx"}}: must call specific tool
+    """
+    if tool_choice == "none":
+        return "\n\nIMPORTANT: Do NOT call any tools. Respond with text only."
+    if tool_choice == "required":
+        return "\n\nIMPORTANT: You MUST call at least one tool. Do not respond with text only."
+    if isinstance(tool_choice, dict):
+        fn_name = tool_choice.get("function", {}).get("name", "")
+        if fn_name:
+            return f'\n\nIMPORTANT: You MUST call the tool "{fn_name}". Do not call other tools.'
+    return ""
+
+
+def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> tuple:
     """Convert OpenAI messages to (prompt_str, images_list).
 
     Returns (prompt, images) where images is a list of (bytes, mime_type) tuples.
@@ -13,7 +33,7 @@ def messages_to_prompt(messages: list, tools: list = None) -> tuple:
     parts = []
     images = []
 
-    if tools:
+    if tools and tool_choice != "none":
         tool_defs = []
         for tool in tools:
             fn = tool.get("function", tool) if tool.get("type") == "function" else tool
@@ -23,12 +43,14 @@ def messages_to_prompt(messages: list, tools: list = None) -> tuple:
                 "parameters": fn.get("parameters", tool.get("parameters", {})),
             })
         if tool_defs:
+            constraint = _build_tool_choice_instruction(tool_choice, tool_defs)
             parts.append(
                 "# Tool Use\n\n"
                 "You can call the following tools. Call format:\n"
                 '```tool_call\n{"name": "func_name", "arguments": {...}}\n```\n'
                 "When calling tools, output ONLY the tool_call block(s).\n\n"
                 f"Available tools:\n{json.dumps(tool_defs, indent=2)}"
+                f"{constraint}"
             )
 
     for msg in messages:
@@ -128,6 +150,23 @@ def build_tool_prompt(tool_defs: list) -> str:
     )
 
 
+def _google_tool_choice_instruction(req: dict) -> str:
+    """Extract tool_choice constraint from Google API toolConfig."""
+    tool_config = req.get("toolConfig", {})
+    fc_config = tool_config.get("functionCallingConfig", {})
+    mode = fc_config.get("mode", "AUTO")
+    allowed = fc_config.get("allowedFunctionNames", [])
+
+    if mode == "NONE":
+        return "\n\nIMPORTANT: Do NOT call any tools. Respond with text only."
+    if mode == "ANY":
+        if allowed:
+            names = ", ".join(f'"{n}"' for n in allowed)
+            return f"\n\nIMPORTANT: You MUST call one of these tools: {names}. Do not respond with text only."
+        return "\n\nIMPORTANT: You MUST call at least one tool. Do not respond with text only."
+    return ""
+
+
 def google_contents_to_prompt(req: dict) -> tuple:
     """Convert Google API contents/tools/systemInstruction to (prompt_str, images_list).
 
@@ -136,9 +175,12 @@ def google_contents_to_prompt(req: dict) -> tuple:
     parts = []
     images = []
 
+    tool_config = req.get("toolConfig", {})
+    fc_mode = tool_config.get("functionCallingConfig", {}).get("mode", "AUTO")
+
     tools = req.get("tools")
     tool_defs = []
-    if tools:
+    if tools and fc_mode != "NONE":
         for tool_group in tools:
             for fn in tool_group.get("functionDeclarations", []):
                 td = {"name": fn.get("name", ""), "description": fn.get("description", "")}
@@ -153,11 +195,13 @@ def google_contents_to_prompt(req: dict) -> tuple:
         sys_text = " ".join(p.get("text", "") for p in sys_parts if p.get("text"))
         if sys_text:
             if tool_defs:
-                parts.append(sys_text + "\n\n" + build_tool_prompt(tool_defs))
+                constraint = _google_tool_choice_instruction(req)
+                parts.append(sys_text + "\n\n" + build_tool_prompt(tool_defs) + constraint)
             else:
                 parts.append(sys_text)
     elif tool_defs:
-        parts.append(build_tool_prompt(tool_defs))
+        constraint = _google_tool_choice_instruction(req)
+        parts.append(build_tool_prompt(tool_defs) + constraint)
 
     for content in req.get("contents", []):
         role = content.get("role", "user")

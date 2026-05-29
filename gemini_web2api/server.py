@@ -145,7 +145,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         tools = req.get("tools")
-        prompt, images = messages_to_prompt(req.get("messages", []), tools)
+        tool_choice = req.get("tool_choice", "auto")
+        prompt, images = messages_to_prompt(req.get("messages", []), tools, tool_choice)
         if not prompt.strip():
             self.send_json({"error": {"message": "empty prompt"}}, 400)
             return
@@ -153,7 +154,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         stream = req.get("stream", False)
         cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
 
-        if stream and not tools:
+        if stream and (not tools or tool_choice == "none"):
             try:
                 self._start_sse()
                 for delta in generate_stream(prompt, model_id, think_mode, _upload_images(images)):
@@ -177,7 +178,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         tool_calls = None
-        if tools and text:
+        if tools and text and tool_choice != "none":
             text, tool_calls = parse_tool_calls(text)
         msg = {"role": "assistant", "content": text or None}
         if tool_calls:
@@ -255,7 +256,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
             tools = [{"type": "function", "function": {"name": t["name"], "description": t.get("description", ""), "parameters": t.get("parameters", {})}}
                      if t.get("type") == "function" and "function" not in t else t for t in tools]
 
-        prompt, images = messages_to_prompt(messages, tools)
+        tool_choice = req.get("tool_choice", "auto")
+        prompt, images = messages_to_prompt(messages, tools, tool_choice)
         if not prompt.strip():
             self.send_json({"error": {"message": "empty input"}}, 400)
             return
@@ -267,7 +269,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         tool_calls = None
-        if tools and text:
+        if tools and text and tool_choice != "none":
             text, tool_calls = parse_tool_calls(text)
 
         rid = f"resp_{uuid.uuid4().hex[:16]}"
@@ -320,7 +322,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": err}}, 400)
             return
 
-        has_tools = bool(req.get("tools"))
+        tool_config = req.get("toolConfig", {})
+        fc_mode = tool_config.get("functionCallingConfig", {}).get("mode", "AUTO")
+        has_tools = bool(req.get("tools")) and fc_mode != "NONE"
         prompt, images = google_contents_to_prompt(req)
         if not prompt.strip():
             self.send_json({"error": {"message": "empty content"}}, 400)
