@@ -225,6 +225,7 @@ The model selection is controlled by field `[79]` in the request payload, mapped
 
 ## Acknowledgments
 
+- [GenericAgent](https://github.com/lsdefine/GenericAgent) — 本项目核心开发依仗 GA 提供的 AI 能力
 - [linux.do](https://linux.do) community
 - Inspired by the open-source API proxy ecosystem
 
