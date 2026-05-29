@@ -66,17 +66,14 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
                     url = c.get("image_url", {}).get("url", "")
                     if url.startswith("data:"):
                         header, b64 = url.split(",", 1) if "," in url else ("", "")
-                        mime = "image/png"
-                        if ":" in header:
-                            mime = header.split(";")[0].split(":")[1]
-                        images.append((base64.b64decode(b64), mime))
+                        text_parts.append(f"\n[Image (base64 PNG)]:\ndata:image/png;base64,{b64}\n")
                     else:
                         images.append((url, None))
                 elif c.get("type") == "image":
                     src = c.get("source", {})
                     if src.get("type") == "base64":
                         mime = src.get("media_type", "image/png")
-                        images.append((base64.b64decode(src["data"]), mime))
+                        text_parts.append(f"\n[Image (base64)]:\ndata:{mime};base64,{src['data']}\n")
             content = " ".join(text_parts)
 
         if role == "system":
