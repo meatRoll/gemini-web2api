@@ -77,14 +77,25 @@ def make_sapisidhash(sapisid: str) -> str:
     return f"SAPISIDHASH {ts}_{h}"
 
 
+def _account_prefix() -> str:
+    """Return the Gemini account path prefix for non-default Google accounts."""
+    auth_user = CONFIG.get("auth_user")
+    if auth_user is None or auth_user == "":
+        return ""
+    return f"/u/{auth_user}"
+
+
 def _build_headers() -> dict:
+    account_prefix = _account_prefix()
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
         "Origin": "https://gemini.google.com",
-        "Referer": "https://gemini.google.com/app",
+        "Referer": f"https://gemini.google.com{account_prefix}/app",
         "X-Same-Domain": "1",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     }
+    if account_prefix:
+        headers["X-Goog-AuthUser"] = str(CONFIG["auth_user"])
     cookie_str, sapisid = load_cookie()
     if cookie_str:
         headers["Cookie"] = cookie_str
@@ -120,13 +131,17 @@ def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list 
         for k, v in extra_fields.items():
             inner[k] = v
     outer = [None, json.dumps(inner)]
-    return urllib.parse.urlencode({"f.req": json.dumps(outer)})
+    params = {"f.req": json.dumps(outer)}
+    if CONFIG.get("xsrf_token"):
+        params["at"] = CONFIG["xsrf_token"]
+    return urllib.parse.urlencode(params)
 
 
 def _get_url() -> str:
     reqid = int(time.time()) % 1000000
+    account_prefix = _account_prefix()
     return (
-        "https://gemini.google.com/_/BardChatUi/data/"
+        f"https://gemini.google.com{account_prefix}/_/BardChatUi/data/"
         "assistant.lamda.BardFrontendService/StreamGenerate"
         f"?bl={CONFIG['gemini_bl']}&hl=en&_reqid={reqid}&rt=c"
     )
