@@ -9,6 +9,8 @@ DEFAULT_CONFIG = {
     "retry_delay_sec": 2,
     "request_timeout_sec": 180,
     "gemini_bl": "boq_assistant-bard-web-server_20260525.09_p0",
+    "auth_user": None,
+    "xsrf_token": None,
     "default_model": "gemini-3.5-flash",
     "log_requests": True,
     "cookie_file": None,
