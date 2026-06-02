@@ -58,6 +58,7 @@ DEFAULT_CONFIG = {
     "log_requests": True,
     "cookie_file": None,
     "proxy": None,
+    "api_keys": [],
 }
 
 CONFIG = dict(DEFAULT_CONFIG)
@@ -427,6 +428,14 @@ class GeminiHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _authorized(self):
+        keys = CONFIG.get("api_keys") or []
+        if not keys:
+            return True
+        auth = self.headers.get("Authorization", "")
+        key = auth[7:] if auth.startswith("Bearer ") else self.headers.get("x-api-key", "")
+        return key in keys
+
     def do_OPTIONS(self):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -436,6 +445,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         try:
+            if self.path.startswith("/v1/") and not self._authorized():
+                self.send_json({"error": {"message": "invalid api key"}}, 401)
+                return
             if self.path == "/v1/models":
                 self.send_json({"object": "list", "data": [
                     {"id": n, "object": "model", "created": 1700000000,
@@ -456,6 +468,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
+            if self.path.startswith("/v1/") and not self._authorized():
+                self.send_json({"error": {"message": "invalid api key"}}, 401)
+                return
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length) if length else b""
             if self.path == "/v1/chat/completions":
