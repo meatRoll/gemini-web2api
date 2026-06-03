@@ -6,7 +6,7 @@
 
 [English](README.md)
 
-将 Google Gemini 网页端转换为 OpenAI 兼容 API. 零认证, 零成本, 跨平台.
+将 Google Gemini 网页端转换为 OpenAI 兼容 API. 零成本, 跨平台, 单文件.
 
 ## 特性
 
@@ -16,14 +16,15 @@
 - **多模型**: Flash, Flash Thinking (2万字+输出), Pro, Auto, Lite
 - **思考深度**: 通过 `@think=N` 后缀调节 (0=最深, 4=最浅)
 - **联网搜索**: 内置互联网访问 (Gemini 原生搜索能力)
-- **跨平台**: 纯 Python, 无外部依赖
-- **流式输出**: SSE Streaming 支持
+- **跨平台**: 纯 Python, 仅一个可选依赖 (`httpx` 用于流式输出)
+- **流式输出**: 基于 `httpx` 的 SSE Streaming 支持
 - **Codex CLI**: Responses API (`/v1/responses`) 兼容 OpenAI Codex
 - **Gemini CLI**: Google 原生 API (`/v1beta/models`) 兼容 Gemini CLI
 
 ## 快速开始
 
 ```bash
+pip install httpx
 python gemini_web2api.py
 ```
 
@@ -96,7 +97,7 @@ gemini-3.5-flash-thinking@think=4   # 最浅
 
 ## 可选: Cookie 配置 (Pro 模型)
 
-匿名访问对所有模型有效, 但 `gemini-3.1-pro` 在无认证时会路由到 Flash. 要获得真正的 Pro 路由, 提供 cookie 文件:
+匿名访问对所有模型有效, 但 `gemini-3.1-pro` 在无认证时会路由到 Flash. 要获得真正的 Pro 路由, 需要 **Gemini Advanced (付费订阅)** 账号的 cookie:
 
 ```bash
 python gemini_web2api.py --cookie-file cookie.txt
@@ -104,7 +105,7 @@ python gemini_web2api.py --cookie-file cookie.txt
 
 ### 如何获取 Cookie
 
-1. 打开 Chrome, 访问 [gemini.google.com](https://gemini.google.com) 并登录任意免费 Google 账号
+1. 打开 Chrome, 访问 [gemini.google.com](https://gemini.google.com) 并登录 **Gemini Advanced** 付费账号
 2. 打开开发者工具 (F12) → Application → Cookies → `https://gemini.google.com`
 3. 复制以下 cookie 值: `SID`, `HSID`, `SSID`, `APISID`, `SAPISID`, `__Secure-1PSID`
 4. 创建 `cookie.txt`, 格式如下:
@@ -143,7 +144,7 @@ https://gemini.google.com/u/1/app/...
 
 如果登录态请求返回 HTTP 400 且错误中包含 `xsrf`, 请刷新 Gemini Web 后更新 `xsrf_token`, 并确认 `auth_user` 与浏览器 URL 中的 `/u/<序号>/` 一致.
 
-不需要付费订阅 — 免费 Google 账号即可.
+Pro 路由需要 **Gemini Advanced** (付费订阅). 免费 Google 账号的 cookie 可以登录认证, 但会静默回退到 Flash.
 
 ## 配置文件
 
@@ -223,7 +224,7 @@ python gemini_web2api.py
 ## 系统要求
 
 - Python 3.8+
-- 无外部依赖 (仅标准库)
+- `httpx` (`pip install httpx`) — 用于流式请求
 - 需要能访问 `gemini.google.com` (部分地区需代理)
 
 ## 工作原理

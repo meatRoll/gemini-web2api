@@ -6,7 +6,7 @@
 
 [中文文档](README_CN.md)
 
-Convert Google Gemini's web interface into an OpenAI-compatible API. Zero authentication, zero cost, cross-platform.
+Convert Google Gemini's web interface into an OpenAI-compatible API. Zero cost, cross-platform, single file.
 
 ## Features
 
@@ -16,14 +16,15 @@ Convert Google Gemini's web interface into an OpenAI-compatible API. Zero authen
 - **Multiple Models**: Flash, Flash Thinking (20k+ char output), Pro, Auto, Lite
 - **Thinking Depth**: Adjustable via `@think=N` suffix (0=deepest, 4=shallowest)
 - **Web Search**: Built-in internet access (Gemini's native search)
-- **Cross-Platform**: Pure Python, no dependencies beyond stdlib
-- **Streaming**: SSE streaming support
+- **Cross-Platform**: Pure Python, single optional dependency (`httpx` for streaming)
+- **Streaming**: SSE streaming support via `httpx`
 - **Codex CLI**: Responses API (`/v1/responses`) for OpenAI Codex integration
 - **Gemini CLI**: Google native API (`/v1beta/models`) for Gemini CLI compatibility
 
 ## Quick Start
 
 ```bash
+pip install httpx
 python gemini_web2api.py
 ```
 
@@ -96,7 +97,7 @@ gemini-3.5-flash-thinking@think=4   # shallowest
 
 ## Optional: Cookie for Pro
 
-Anonymous access works for all models, but `gemini-3.1-pro` routes to Flash without authentication. To get real Pro routing, provide a cookie file:
+Anonymous access works for all models, but `gemini-3.1-pro` routes to Flash without authentication. To get real Pro routing, you need a **Gemini Advanced (paid subscription)** account cookie:
 
 ```bash
 python gemini_web2api.py --cookie-file cookie.txt
@@ -104,7 +105,7 @@ python gemini_web2api.py --cookie-file cookie.txt
 
 ### How to get cookies
 
-1. Open Chrome, go to [gemini.google.com](https://gemini.google.com) and sign in with any free Google account
+1. Open Chrome, go to [gemini.google.com](https://gemini.google.com) and sign in with a **Gemini Advanced** Google account
 2. Open DevTools (F12) → Application → Cookies → `https://gemini.google.com`
 3. Copy these cookie values: `SID`, `HSID`, `SSID`, `APISID`, `SAPISID`, `__Secure-1PSID`
 4. Create `cookie.txt` in this format:
@@ -143,7 +144,7 @@ Example:
 
 If authenticated requests return HTTP 400 with an `xsrf` error, refresh Gemini Web, update `xsrf_token`, and make sure `auth_user` matches the `/u/<index>/` part of the browser URL.
 
-No paid subscription needed — a free Google account is sufficient.
+Pro routing requires **Gemini Advanced** (paid subscription). A free Google account cookie will authenticate but silently fall back to Flash.
 
 ## Configuration
 
@@ -240,7 +241,7 @@ resp = client.chat.completions.create(
 ## Requirements
 
 - Python 3.8+
-- No external dependencies (stdlib only)
+- `httpx` (`pip install httpx`) — used for streaming requests
 - Network access to `gemini.google.com` (proxy/VPN may be needed in some regions)
 
 ## How It Works
