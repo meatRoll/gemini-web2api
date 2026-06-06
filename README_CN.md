@@ -192,6 +192,8 @@ docker run -d --name gemini-web2api -p 8081:8081 -v ./config.json:/app/config.js
 
 此时 `config.json` 中设置 `"cookie_file": "/app/cookie.txt"`.
 
+> **注意**: 如果 Docker 默认 bridge 网络下出现空回复 (`content: null`), 请切换到 host 网络: `docker run --network host ...` 或在 compose 文件中添加 `network_mode: host`. 这是 Gemini 上游拒绝来自 Docker NAT IP 段的请求导致的.
+
 ## 代理配置
 
 如果无法直接访问 `gemini.google.com` (连接超时), 需要配置代理:

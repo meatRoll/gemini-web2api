@@ -192,6 +192,8 @@ docker run -d --name gemini-web2api -p 8081:8081 -v ./config.json:/app/config.js
 
 Set `"cookie_file": "/app/cookie.txt"` in `config.json`.
 
+> **Note**: If you get empty responses (`content: null`) with Docker's default bridge network, switch to host networking: `docker run --network host ...` or add `network_mode: host` in your compose file. This is caused by Gemini's upstream rejecting requests from certain Docker NAT IP ranges.
+
 ## Proxy
 
 If you cannot access `gemini.google.com` directly (connection timeout), configure a proxy:
