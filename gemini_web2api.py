@@ -430,7 +430,8 @@ def parse_tool_calls(text: str) -> tuple:
 
 class GeminiHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
-        log(fmt % args)
+        client_ip = self.client_address[0] if self.client_address else "-"
+        log(f"{client_ip} {fmt % args}")
 
     def send_json(self, data, status=200):
         body = json.dumps(data, ensure_ascii=False).encode()
