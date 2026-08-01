@@ -2586,14 +2586,10 @@ export default {
       if (path === '/' || path === '/health') {
         return sendJSON({
           status: 'ok',
-          version: '1.5.0-cf-multifingerprint',  // 版本标识
+          version: '1.5.0-cf-multifingerprint',
           platform: 'Cloudflare Workers',
           models: Object.keys(MODELS),
           defaultModel: config.defaultModel,
-          hasCookie: !!config.cookieString,      // 是否配置了 Cookie
-          hasSapisid: !!config.sapisid,          // 是否配置了 SAPISID
-          fingerprintJitterMs: config.fingerprintJitterMs,  // 随机延迟配置
-          rateLimit: config.rateLimit,            // 速率限制配置
         });
       }
 
@@ -2661,14 +2657,14 @@ export default {
         return handleResponses(request, body, config);
       }
 
-      // ---- Google 原生 generateContent（非流式） ----
-      if (path.indexOf(':generateContent') !== -1 && path.indexOf('stream') === -1) {
-        return handleGoogleAPI(request, body, false, config);
-      }
-
       // ---- Google 原生 streamGenerateContent（流式） ----
       if (path.indexOf(':streamGenerateContent') !== -1) {
         return handleGoogleAPI(request, body, true, config);
+      }
+
+      // ---- Google 原生 generateContent（非流式） ----
+      if (path.indexOf(':generateContent') !== -1) {
+        return handleGoogleAPI(request, body, false, config);
       }
 
       // ---- 万能兜底路由 ----

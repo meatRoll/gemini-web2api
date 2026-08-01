@@ -561,6 +561,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
+                first_chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
+                               "model": model_name, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]}
+                self.wfile.write(f"data: {json.dumps(first_chunk)}\n\n".encode())
                 for delta_text in gemini_stream_generate_iter(prompt, model_id, think_mode):
                     chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                              "model": model_name, "choices": [{"index": 0, "delta": {"content": delta_text}, "finish_reason": None}]}
