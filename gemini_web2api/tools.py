@@ -1,5 +1,6 @@
 """Tool calling and multimodal message parsing."""
 import json
+from jsonschema import validators, ValidationError, SchemaError
 import re
 import uuid
 import base64
@@ -8,6 +9,14 @@ import io
 from urllib.parse import unquote_to_bytes
 
 MAX_IMAGE_B64_SIZE = 50000  # ~37KB raw image
+
+# Use a client-specific fence; retain the old marker for existing responses.
+TOOL_CALL_MARKER_PATTERN = r'```(?:client_operation|tool_call)\b'
+TOOL_CALL_PATTERN = r'```(?:client_operation|tool_call)\s*\n(.*?)\n```'
+
+
+def has_tool_call_marker(text: str) -> bool:
+    return bool(re.search(TOOL_CALL_MARKER_PATTERN, text or ""))
 
 
 def _compress_b64_if_needed(b64: str) -> str:
@@ -101,6 +110,32 @@ def _image_from_part(part: dict):
     return None
 
 
+def _code_artifact_instruction(messages: list) -> str:
+    """Add code artifact guidance only for the latest user task."""
+    for message in reversed(messages):
+        if message.get("role", "user") != "user":
+            continue
+        content = message.get("content", "")
+        if isinstance(content, list):
+            content = " ".join(
+                part.get("text", "") for part in content
+                if part.get("type") in ("text", "input_text")
+            )
+        if not isinstance(content, str) or not re.search(
+            r"\b(?:svg|html|css|javascript|animation)\b|\.(?:svg|html?|css|[cm]?js)\b|动画",
+            content, re.IGNORECASE,
+        ):
+            return ""
+        return (
+            "# Code Artifact Task\n\n"
+            "SVG, HTML, CSS, JavaScript, and animations are code artifacts. "
+            "When asked to create or modify one, use the available file operations "
+            "to make the actual change. Implement motion with SVG SMIL, CSS, or "
+            "JavaScript; wait for successful operation results before claiming completion.\n"
+        )
+    return ""
+
+
 def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> tuple:
     """Convert OpenAI messages to (prompt_str, images_list).
 
@@ -108,6 +143,7 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
     """
     parts = []
     images = []
+    tooling_enabled = False
 
     if tools and tool_choice != "none":
         tool_defs = []
@@ -119,16 +155,32 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
                 "parameters": fn.get("parameters", tool.get("parameters", {})),
             })
         if tool_defs:
-            constraint = _build_tool_choice_instruction(tool_choice, tool_defs)
+            tooling_enabled = True
             parts.append(
-                "# Tool Use\n\n"
-                "You can call the following tools. Call format:\n"
-                '```tool_call\n{"name": "func_name", "arguments": {...}}\n```\n'
-                "When calling tools, output ONLY the tool_call block(s).\n\n"
+                "# Client Operation Protocol\n\n"
+                "Your role is to produce structured operation requests using the declared tool schemas. "
+                "The client executes operations and sends authoritative results in subsequent messages. "
+                "Producing an operation request does not require direct filesystem or terminal access. "
+                "Paths belong to the executor workspace. When the task needs file information, request read; "
+                "do not invent contents or ask the user to paste them. "
+                "After each result, continue the requested work. If unfinished, request the next operation. "
+                "Claim a change only after a successful edit or write result, and claim verification only "
+                "after a successful verification result. "
+                "For an operation output only fenced client_operation JSON with name and arguments. "
+                "Put every declared tool parameter inside the arguments object. "
+                "Escape newlines and double quotes inside JSON strings, and close both the JSON object "
+                "and the client_operation fence. This is plain text for the external client to parse. "
+                "Give a final answer only after the requested operations and verification have completed. "
+                "Do not call image or video generation services.\n\n"
+                "Call format:\n"
+                '```client_operation\n{"name":"tool_name","arguments":{}}\n```\n\n'
                 f"Available tools:\n{json.dumps(tool_defs, indent=2)}"
-                f"{constraint}"
             )
+            code_instruction = _code_artifact_instruction(messages)
+            if code_instruction:
+                parts.append(code_instruction)
 
+    call_names = {}
     for msg in messages:
         role = msg.get("role", "user")
         content = msg.get("content", "")
@@ -152,26 +204,66 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
                 tc_strs = []
                 for tc in msg["tool_calls"]:
                     fn = tc.get("function", {})
+                    call_names[tc.get("id", "")] = fn.get("name", "")
                     tc_strs.append(
-                        f'```tool_call\n{{"name": "{fn.get("name")}", '
+                        f'```client_operation\n{{"name": "{fn.get("name")}", '
                         f'"arguments": {fn.get("arguments", "{}")}}}\n```'
                     )
                 parts.append(f"[Assistant]: {content or ''}\n" + "\n".join(tc_strs))
             else:
                 parts.append(f"[Assistant]: {content}")
         elif role == "tool":
-            parts.append(f"[Tool result for {msg.get('name', '')}]: {content}")
+            call_id = msg.get("tool_call_id", "")
+            name = msg.get("name") or call_names.get(call_id, "")
+            parts.append(f"[Tool result for {name} (call_id={call_id})]: {content}")
         else:
             parts.append(content if content else "")
+
+    if tooling_enabled:
+        constraint = _build_tool_choice_instruction(tool_choice, tool_defs)
+        if constraint:
+            parts.append(constraint.strip())
 
     prompt = "\n\n".join(p for p in parts if p)
     return prompt, images
 
 
+def valid_tool_call_candidate(text: str) -> bool:
+    matches = list(re.finditer(TOOL_CALL_PATTERN, text or "", re.DOTALL))
+    markers = re.findall(TOOL_CALL_MARKER_PATTERN, text or "")
+    if not matches or len(matches) != len(markers):
+        return False
+    for match in matches:
+        try:
+            data = json.loads(match.group(1))
+        except (json.JSONDecodeError, TypeError):
+            return False
+        if (not isinstance(data, dict) or not isinstance(data.get("name"), str)
+                or not data["name"].strip() or not isinstance(data.get("arguments", {}), dict)):
+            return False
+    return True
+
+
+def validate_tool_calls(calls: list, tools: list):
+    definitions = {t["function"]["name"]: t["function"] for t in tools
+                   if t.get("type") == "function" and isinstance(t.get("function"), dict)}
+    for call in calls:
+        function = call["function"]
+        if function["name"] not in definitions:
+            raise ValueError("Gemini returned an unknown tool name")
+        schema = definitions[function["name"]].get("parameters", {})
+        try:
+            validator = validators.validator_for(schema)
+            validator.check_schema(schema)
+            validator(schema).validate(json.loads(function["arguments"]))
+        except (ValidationError, SchemaError, json.JSONDecodeError):
+            raise ValueError("Tool arguments do not match the declared schema") from None
+
+
 def parse_tool_calls(text: str) -> tuple:
-    """Extract tool_call blocks. Returns (clean_text, tool_calls_list)."""
+    """Extract client operation blocks. Returns (clean_text, tool_calls_list)."""
     tool_calls = []
-    pattern = r'```tool_call\s*\n(.*?)\n```'
+    pattern = TOOL_CALL_PATTERN
     clean_parts = []
     last_end = 0
     for m in re.finditer(pattern, text, re.DOTALL):
@@ -179,6 +271,9 @@ def parse_tool_calls(text: str) -> tuple:
         last_end = m.end()
         try:
             data = json.loads(m.group(1).strip())
+            if (not isinstance(data, dict) or not isinstance(data.get("name"), str)
+                    or not data["name"].strip() or not isinstance(data.get("arguments", {}), dict)):
+                raise ValueError("Invalid tool call structure")
             tool_calls.append({
                 "id": f"call_{uuid.uuid4().hex[:8]}",
                 "type": "function",
@@ -187,8 +282,9 @@ def parse_tool_calls(text: str) -> tuple:
                     "arguments": json.dumps(data.get("arguments", {}), ensure_ascii=False),
                 },
             })
-        except (json.JSONDecodeError, KeyError):
-            pass
+        except (ValueError, KeyError, TypeError):
+            # Do not silently discard malformed model output.
+            clean_parts.append(m.group(0))
     clean_parts.append(text[last_end:])
     clean = "".join(clean_parts).strip()
     return clean, tool_calls

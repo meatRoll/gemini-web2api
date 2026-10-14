@@ -384,7 +384,7 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
                     buf += chunk
                     if "BardErrorInfo" in buf:
                         import re as _re
-                        m = _re.search(r'BardErrorInfo\s*\[(\d+)\]', buf)
+                        m = _re.search(r'BardErrorInfo(?:"\s*,\s*\[|\s*\[)(\d+)\]', buf)
                         if m:
                             raise RuntimeError(f"Gemini upstream rejected request: BardErrorInfo [{m.group(1)}]")
                     while "\n" in buf:
@@ -433,7 +433,7 @@ def clean_gemini_text(text: str, strip: bool = True) -> str:
 def extract_response_text(raw: str) -> str:
     """Parse StreamGenerate response to extract final text."""
     import re as _re
-    bard_err = _re.search(r'BardErrorInfo\s*\[(\d+)\]', raw)
+    bard_err = _re.search(r'BardErrorInfo(?:"\s*,\s*\[|\s*\[)(\d+)\]', raw)
     if bard_err:
         raise RuntimeError(f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]")
     texts = []

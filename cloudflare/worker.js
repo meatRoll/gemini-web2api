@@ -1315,7 +1315,7 @@ function extractResponseText(raw) {
   // 第一步：检查 BardErrorInfo 错误
   // 格式: BardErrorInfo [错误代码]
   // 例如: BardErrorInfo [10] 表示请求被拒绝
-  var bardErr = raw.match(/BardErrorInfo\s*\[(\d+)\]/);
+  var bardErr = raw.match(/BardErrorInfo(?:"\s*,\s*\[|\s*\[)(\d+)\]/);
   if (bardErr) {
     throw new Error('Gemini upstream rejected request: BardErrorInfo [' + bardErr[1] + ']');
   }
@@ -2147,7 +2147,7 @@ async function handleChatCompletions(request, body, config) {
 
               // 检查 Gemini 错误信息
               if (buffer.indexOf('BardErrorInfo') !== -1) {
-                var match = buffer.match(/BardErrorInfo\s*\[(\d+)\]/);
+                var match = buffer.match(/BardErrorInfo(?:"\s*,\s*\[|\s*\[)(\d+)\]/);
                 if (match) {
                   throw new Error('Gemini upstream rejected request: BardErrorInfo [' + match[1] + ']');
                 }

@@ -1,18 +1,20 @@
 import http.client
 import base64
+import io
 import json
 import os
 import tempfile
 import threading
 import unittest
 from unittest import mock
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlsplit
 
 from gemini_web2api.config import CONFIG, DEFAULT_CONFIG
+from gemini_web2api import gemini, rotation
 from gemini_web2api.cache import CACHE
 from gemini_web2api.gemini import _build_payload
-from gemini_web2api.server import GeminiHandler, ThreadedServer
-from gemini_web2api.tools import google_contents_to_prompt, messages_to_prompt
+from gemini_web2api.server import GeminiHandler, ThreadedServer, _classify_response_quality
+from gemini_web2api.tools import google_contents_to_prompt, messages_to_prompt, parse_tool_calls
 
 
 def _decode_payload(payload):
@@ -35,6 +37,198 @@ def _decode_sse(body):
         if event_type and data:
             events.append((event_type, json.loads(data)))
     return events
+
+
+class RotationTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.directory.name, "auth.json")
+        with open(self.path, "w") as out:
+            json.dump({"cookie": "SAPISID=keep; __Secure-1PSIDTS=old; __Secure-1PSIDCC=old-cc",
+                       "sapisid": "keep", "xsrf_token": "token"}, out)
+        os.chmod(self.path, 0o600)
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def test_rotation_preserves_metadata_and_writes_private_json(self):
+        response = mock.MagicMock()
+        response.headers.get_all.return_value = [
+            "__Secure-1PSIDTS=new; Secure; HttpOnly",
+            "__Secure-1PSIDCC=new-cc; Secure; HttpOnly",
+            "UNRELATED=ignored; Secure",
+        ]
+        with mock.patch.object(rotation.urllib.request, "urlopen") as urlopen:
+            urlopen.return_value.__enter__.return_value = response
+            self.assertEqual(rotation.rotate_cookie_file(self.path), "updated_2")
+            request = urlopen.call_args.args[0]
+            self.assertEqual(request.data, rotation.ROTATE_BODY)
+            self.assertEqual(urlopen.call_args.kwargs["timeout"], 25)
+        with open(self.path) as source:
+            result = json.load(source)
+        self.assertEqual(result["xsrf_token"], "token")
+        self.assertEqual(result["sapisid"], "keep")
+        self.assertIn("__Secure-1PSIDTS=new", result["cookie"])
+        self.assertIn("__Secure-1PSIDCC=new-cc", result["cookie"])
+        self.assertNotIn("UNRELATED", result["cookie"])
+        self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
+
+    def test_rotation_does_not_overwrite_new_export(self):
+        response = mock.MagicMock()
+        response.headers.get_all.return_value = ["__Secure-1PSIDTS=rotated; Secure"]
+
+        def new_export(*_args, **_kwargs):
+            with open(self.path, "w") as out:
+                json.dump({"cookie": "SAPISID=fresh", "xsrf_token": "fresh"}, out)
+            os.utime(self.path, ns=(os.stat(self.path).st_atime_ns,
+                                    os.stat(self.path).st_mtime_ns + 1_000_000_000))
+            return mock.MagicMock(__enter__=lambda _: response, __exit__=lambda *_: None)
+
+        with mock.patch.object(rotation.urllib.request, "urlopen", side_effect=new_export):
+            self.assertEqual(rotation.rotate_cookie_file(self.path), "file_changed")
+        with open(self.path) as source:
+            self.assertEqual(json.load(source)["xsrf_token"], "fresh")
+    def test_rotation_worker_health(self):
+        original_config = dict(CONFIG)
+        try:
+            CONFIG.update(cookie_rotation_interval_sec=300, cookie_file=self.path)
+            with mock.patch.object(rotation, "_rotation_thread", None):
+                self.assertFalse(rotation.rotation_worker_alive())
+            with mock.patch.object(rotation, "_rotation_thread") as thread:
+                thread.is_alive.return_value = True
+                self.assertTrue(rotation.rotation_worker_alive())
+        finally:
+            CONFIG.clear()
+            CONFIG.update(original_config)
+
+
+class AuthSyncTests(unittest.TestCase):
+    def setUp(self):
+        self.original_config = dict(CONFIG)
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.auth_file = os.path.join(self.tmpdir.name, "auth.json")
+        CONFIG.update(cookie_file=self.auth_file, auth_user=None, xsrf_token="old-token",
+                      gemini_bl="old-build", proxy=None, retry_attempts=1,
+                      log_requests=False)
+        self.write_auth("first-token", "first-build", "1")
+
+    def tearDown(self):
+        CONFIG.clear()
+        CONFIG.update(self.original_config)
+        gemini._cookie_cache.update(str="", sapisid=None, mtime=0, path=None)
+        self.tmpdir.cleanup()
+
+    def write_auth(self, token, build, user):
+        with open(self.auth_file, "w") as out:
+            json.dump({"cookie": "SAPISID=test; __Secure-1PSID=session",
+                       "sapisid": "test", "xsrf_token": token,
+                       "gemini_bl": build, "auth_user": user}, out)
+        os.utime(self.auth_file, None)
+
+    def test_generate_uses_export_metadata_on_first_request_and_after_update(self):
+        requests = []
+
+        def urlopen(request, **_kwargs):
+            requests.append(request)
+            return io.BytesIO(b"")
+
+        with mock.patch.object(gemini.urllib.request, "urlopen", side_effect=urlopen):
+            gemini.generate("hello", 1, 4)
+            self.write_auth("second-token", "second-build", "2")
+            gemini.generate("hello", 1, 4)
+
+        for request, token, build, user in zip(
+            requests, ("first-token", "second-token"),
+            ("first-build", "second-build"), ("1", "2")
+        ):
+            self.assertEqual(parse_qs(request.data.decode())["at"], [token])
+            self.assertEqual(parse_qs(urlsplit(request.full_url).query)["bl"], [build])
+            self.assertIn(f"/u/{user}/", request.full_url)
+            self.assertIn(f"/u/{user}/app", request.get_header("Referer"))
+
+    def test_stream_uses_export_metadata_before_building_request(self):
+        client = mock.MagicMock()
+        response = client.stream.return_value.__enter__.return_value
+        response.iter_text.return_value = iter(())
+        with mock.patch.object(gemini, "HAS_HTTPX", True), \
+             mock.patch.object(gemini, "_get_httpx_client", return_value=client):
+            self.assertEqual(list(gemini.generate_stream("hello", 1, 4)), [])
+        args, kwargs = client.stream.call_args
+        self.assertEqual(parse_qs(kwargs["content"])["at"], ["first-token"])
+        self.assertEqual(parse_qs(urlsplit(args[1]).query)["bl"], ["first-build"])
+        self.assertIn("/u/1/", args[1])
+
+    def test_stream_flushes_unterminated_final_line(self):
+        client = mock.MagicMock()
+        response = client.stream.return_value.__enter__.return_value
+        response.iter_text.return_value = iter(["tail"])
+        with mock.patch.object(gemini, "HAS_HTTPX", True), \
+             mock.patch.object(gemini, "_get_httpx_client", return_value=client), \
+             mock.patch.object(gemini, "_extract_texts_from_line", return_value=["tail"]):
+            self.assertEqual(list(gemini.generate_stream("hello", 1, 4)), ["tail"])
+
+    def test_candidate_selection_rejects_mixed_complete_and_partial(self):
+        complete = '```tool_call\n{"name":"read","arguments":{}}\n```'
+        self.assertFalse(gemini._valid_tool_call_candidate(complete + '\n```tool_call\n{"name":'))
+        for payload in ('[]', '{"name":3}', '{"name":"read","arguments":"bad"}'):
+            self.assertFalse(gemini._valid_tool_call_candidate('```tool_call\n' + payload + '\n```'))
+
+    def test_candidate_selection_rejects_incomplete_tool_call(self):
+        with self.assertRaises(RuntimeError):
+            gemini._select_response_text([
+                '```tool_call\n{"name":"bash","arguments":{"command":"cat',
+            ])
+
+    def test_candidate_selection_uses_last_complete_tool_call(self):
+        first = '```tool_call\n{"name":"bash","arguments":{"command":"one"}}\n```'
+        second = '```tool_call\n{"name":"bash","arguments":{"command":"two"}}\n```'
+        self.assertEqual(gemini._select_response_text([first, second]), second)
+
+    def test_client_operation_selection_rejects_partial_final_snapshot(self):
+        complete = '```client_operation\n{"name":"read","arguments":{"path":"a"}}\n```'
+        partial = '```client_operation\n{"name":"read","arguments":{"path":"b'
+        self.assertEqual(gemini._select_response_text([partial, complete]), complete)
+        with self.assertRaises(RuntimeError):
+            gemini._select_response_text([complete, partial])
+        self.assertFalse(gemini._valid_tool_call_candidate(complete + '\n' + partial))
+
+    def test_buffered_budget_limits_timeout_and_attempts(self):
+        with mock.patch.object(gemini.urllib.request, "urlopen", side_effect=TimeoutError("slow")) as open_request:
+            with self.assertRaises(TimeoutError):
+                gemini.generate("hello", 1, 4, budget_sec=45, max_attempts=1)
+        self.assertEqual(open_request.call_count, 1)
+        self.assertLessEqual(open_request.call_args.kwargs["timeout"], 45)
+
+    def test_buffered_cancel_closes_response(self):
+        response = io.BytesIO(b"response")
+        with mock.patch.object(gemini.urllib.request, "urlopen", return_value=response), \
+             mock.patch.object(gemini, "extract_response_text", return_value="ok"):
+            with self.assertRaises(ConnectionAbortedError):
+                gemini.generate("hello", 1, 4, budget_sec=45, max_attempts=1,
+                                cancelled=mock.Mock(side_effect=[False, True]))
+        self.assertTrue(response.closed)
+
+    def test_stream_does_not_retry_after_emitting_output(self):
+        client = mock.MagicMock()
+        response = client.stream.return_value.__enter__.return_value
+
+        def interrupted():
+            yield "partial\n"
+            raise RuntimeError("connection interrupted")
+
+        response.iter_text.side_effect = interrupted
+        original_attempts = CONFIG["retry_attempts"]
+        CONFIG["retry_attempts"] = 3
+        try:
+            with mock.patch.object(gemini, "HAS_HTTPX", True), \
+                 mock.patch.object(gemini, "_get_httpx_client", return_value=client), \
+                 mock.patch.object(gemini, "_extract_texts_from_line", return_value=["partial"]):
+                with self.assertRaisesRegex(RuntimeError, "connection interrupted"):
+                    list(gemini.generate_stream("hello", 1, 4))
+            self.assertEqual(client.stream.call_count, 1)
+        finally:
+            CONFIG["retry_attempts"] = original_attempts
+
 
 
 class PayloadPersistenceTests(unittest.TestCase):
@@ -92,6 +286,53 @@ class ContextCacheTests(unittest.TestCase):
 
 
 class MessageParsingTests(unittest.TestCase):
+    def test_code_guidance_follows_current_user_task(self):
+        tools = [{"type": "function", "function": {
+            "name": "read", "parameters": {"type": "object"},
+        }}]
+        for content in (
+            "创建一个鹈鹕骑单车的svg动画",
+            [{"type": "input_text", "text": "Review artifact.svg"}],
+        ):
+            with self.subTest(content=content):
+                prompt, _ = messages_to_prompt([{"role": "user", "content": content}], tools)
+                self.assertIn("# Code Artifact Task", prompt)
+        prompt, _ = messages_to_prompt([
+            {"role": "user", "content": "Create an SVG animation"},
+            {"role": "assistant", "content": "Created artifact.svg"},
+            {"role": "user", "content": "Read a.txt and b.txt"},
+        ], tools)
+        self.assertNotIn("# Code Artifact Task", prompt)
+        self.assertIn("# Client Operation Protocol", prompt)
+        self.assertNotIn("# Local Coding Agent Environment", prompt)
+        self.assertNotIn("# Final Execution Rule", prompt)
+
+    def test_operation_protocol_preserves_tool_choice_and_result_history(self):
+        tools = [{"type": "function", "function": {
+            "name": "read", "parameters": {"type": "object"},
+        }}]
+        messages = [
+            {"role": "assistant", "tool_calls": [{"id": "call_read", "function": {
+                "name": "read", "arguments": '{"path":"a.txt"}',
+            }}]},
+            {"role": "tool", "tool_call_id": "call_read", "content": "ACTUAL_RESULT"},
+            {"role": "user", "content": "Now read b.txt"},
+        ]
+        for choice in (None, "auto", "required", {"type": "function", "function": {"name": "read"}}):
+            with self.subTest(choice=choice):
+                prompt, _ = messages_to_prompt(messages, tools, choice)
+                self.assertIn("[Tool result for read (call_id=call_read)]: ACTUAL_RESULT", prompt)
+                self.assertIn("Now read b.txt", prompt)
+                self.assertIn('```client_operation\n{"name":"tool_name","arguments":{}}', prompt)
+                self.assertIn('```client_operation\n{"name": "read", "arguments": {"path":"a.txt"}}', prompt)
+                self.assertNotIn("```tool_call", prompt)
+                self.assertEqual("IMPORTANT:" in prompt, choice not in (None, "auto"))
+                if choice not in (None, "auto"):
+                    self.assertGreater(prompt.index("IMPORTANT:"), prompt.index("Now read b.txt"))
+        prompt, _ = messages_to_prompt(messages, tools, "none")
+        self.assertNotIn("# Client Operation Protocol", prompt)
+        self.assertNotIn("Available tools:", prompt)
+
     def test_messages_to_prompt_extracts_openai_image_url_data_url(self):
         image_data = base64.b64encode(b"fake png").decode()
 
@@ -130,6 +371,24 @@ class MessageParsingTests(unittest.TestCase):
         self.assertEqual(prompt, "Describe")
         self.assertEqual(images, [])
 
+    def test_response_quality_classifies_refusal_variants(self):
+        self.assertEqual(
+            _classify_response_quality(
+                "create file", "I seem to be encountering an error. Can I try something else for you?", True
+            ),
+            "temporary_refusal",
+        )
+        self.assertEqual(
+            _classify_response_quality(
+                "create file", "```tool_call\n{\"name\":\"write\",\"arguments\":{}}\n```", True
+            ),
+            "normal",
+        )
+    def test_malformed_tool_call_is_not_silently_dropped(self):
+        text = "before\n```tool_call\nnot valid json\n```\nafter"
+        clean, calls = parse_tool_calls(text)
+        self.assertEqual(calls, [])
+        self.assertIn("not valid json", clean)
     def test_google_contents_to_prompt_extracts_inline_image_data(self):
         image_data = base64.b64encode(b"fake png").decode()
 
@@ -184,6 +443,101 @@ class StreamingEndpointTests(unittest.TestCase):
         CONFIG.clear()
         CONFIG.update(self.original_config)
 
+    @mock.patch("gemini_web2api.server.generate", side_effect=TimeoutError("budget exhausted"))
+    def test_agent_timeout_returns_504(self, generate):
+        CONFIG["agent_request_budget_sec"] = 300
+        status, _, body = self.post_json("/v1/chat/completions", {
+            "messages": [{"role": "user", "content": "read"}],
+            "tools": [{"type": "function", "function": {"name": "read"}}],
+        })
+        self.assertEqual(status, 504)
+        self.assertTrue(json.loads(body)["error"]["retryable"])
+        self.assertEqual(generate.call_args.kwargs["max_attempts"], 1)
+        self.assertEqual(generate.call_args.kwargs["budget_sec"], 300)
+
+    @mock.patch("gemini_web2api.server.generate")
+    def test_agent_busy_does_not_start_generation(self, generate):
+        from gemini_web2api.server import _agent_slot
+        self.assertTrue(_agent_slot.acquire(blocking=False))
+        try:
+            status, _, _ = self.post_json("/v1/chat/completions", {
+                "messages": [{"role": "user", "content": "read"}],
+                "tools": [{"type": "function", "function": {"name": "read"}}],
+            })
+        finally:
+            _agent_slot.release()
+        self.assertEqual(status, 503)
+        generate.assert_not_called()
+
+    @mock.patch("gemini_web2api.server.generate")
+    def test_tool_schema_and_unknown_name_are_rejected(self, generate):
+        tools = [{"type": "function", "function": {"name": "read", "parameters": {
+            "type": "object", "required": ["path"], "properties": {"path": {"type": "string"}}
+        }}}]
+        for name, args in (("unknown", {"path": "a"}), ("read", {}), ("read", {"path": 3})):
+            generate.return_value = '```tool_call\n' + json.dumps({"name": name, "arguments": args}) + '\n```'
+            for path, input_key in (("/v1/chat/completions", "messages"), ("/v1/responses", "input")):
+                status, _, body = self.post_json(path, {
+                    input_key: [{"role": "user", "content": "read"}], "tools": tools,
+                })
+                self.assertEqual(status, 502)
+                self.assertEqual(json.loads(body)["error"]["type"], "tool_call_parse_error")
+
+    @mock.patch("gemini_web2api.server.generate")
+    def test_client_operation_preserves_multiline_arguments_and_schema_validation(self, generate):
+        tools = [{"type": "function", "function": {"name": "write", "parameters": {
+            "type": "object", "required": ["path", "content"],
+            "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+        }}}]
+        args = {"path": "test.svg", "content": '<svg>\n<circle title="中文"/>\n</svg>'}
+        for path, input_key in (("/v1/chat/completions", "messages"), ("/v1/responses", "input")):
+            with self.subTest(path=path):
+                generate.return_value = '```client_operation\n' + json.dumps({
+                    "name": "write", "arguments": args,
+                }) + '\n```'
+                status, _, body = self.post_json(path, {
+                    input_key: [{"role": "user", "content": "write"}], "tools": tools,
+                })
+                self.assertEqual(status, 200)
+                data = json.loads(body)
+                if input_key == "messages":
+                    function = data["choices"][0]["message"]["tool_calls"][0]["function"]
+                else:
+                    function = data["output"][0]
+                self.assertEqual(function["name"], "write")
+                self.assertEqual(json.loads(function["arguments"]), args)
+
+                generate.return_value = '```client_operation\n' + json.dumps({
+                    "name": "write", "arguments": {"path": "test.svg"},
+                }) + '\n```'
+                status, _, body = self.post_json(path, {
+                    input_key: [{"role": "user", "content": "write"}], "tools": tools,
+                })
+                self.assertEqual(status, 502)
+                self.assertEqual(json.loads(body)["error"]["type"], "tool_call_parse_error")
+
+    @mock.patch("gemini_web2api.server.generate", return_value="I seem to be encountering an error. Can I try something else for you?")
+    def test_temporary_refusal_returns_error_on_both_endpoints(self, generate):
+        for path, input_key in (("/v1/chat/completions", "messages"), ("/v1/responses", "input")):
+            status, _, body = self.post_json(path, {
+                input_key: [{"role": "user", "content": "read"}],
+                "tools": [{"type": "function", "function": {"name": "read"}}],
+            })
+            self.assertEqual(status, 503)
+            self.assertEqual(json.loads(body)["error"]["type"], "upstream_temporary_refusal")
+        self.assertEqual(_classify_response_quality("", 'Quoted: I seem to be encountering an error.', True), "normal")
+        self.assertEqual(_classify_response_quality("", "I couldn't do that because it is unsafe.", True), "normal")
+
+    def test_root_health_reports_dead_rotation_worker(self):
+        with mock.patch("gemini_web2api.server.rotation_worker_alive", return_value=False):
+            connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+            connection.request("GET", "/")
+            response = connection.getresponse()
+            data = json.loads(response.read())
+            connection.close()
+        self.assertEqual(response.status, 503)
+        self.assertEqual(data["status"], "unhealthy")
+
     def post_json(self, path, payload):
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
         connection.request(
@@ -236,6 +590,122 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(chunks[0]["choices"][0]["delta"], {"role": "assistant"})
         self.assertEqual(chunks[1]["choices"][0]["delta"], {"content": "hel"})
         self.assertEqual(chunks[2]["choices"][0]["delta"], {"content": "lo"})
+        self.assertTrue(body.endswith("data: [DONE]\n\n"))
+
+    @mock.patch("gemini_web2api.server.parse_tool_calls")
+    @mock.patch("gemini_web2api.server.generate", return_value="ignored")
+    def test_chat_stream_emits_tool_calls_in_delta(self, _generate, parse_tool_calls):
+        parse_tool_calls.return_value = (
+            "",
+            [{
+                "id": "call_test",
+                "type": "function",
+                "function": {
+                    "name": "read",
+                    "arguments": '{"path":"/tmp/fixture.txt"}',
+                },
+            }],
+        )
+
+        status, _, body = self.post_json(
+            "/v1/chat/completions",
+            {
+                "model": "gemini-3.6-flash",
+                "messages": [{"role": "user", "content": "read the file"}],
+                "tools": [{"type": "function", "function": {
+                    "name": "read", "parameters": {"type": "object"}
+                }}],
+                "stream": True,
+            },
+        )
+
+        self.assertEqual(status, 200)
+        chunks = [
+            json.loads(line[len("data: "):])
+            for line in body.splitlines()
+            if line.startswith("data: {")
+        ]
+        delta = chunks[0]["choices"][0]["delta"]
+        self.assertEqual(delta["role"], "assistant")
+        self.assertIsNone(delta["content"])
+        self.assertEqual(delta["tool_calls"][0]["index"], 0)
+        self.assertEqual(delta["tool_calls"][0]["function"]["name"], "read")
+        self.assertEqual(chunks[0]["choices"][0]["finish_reason"], "tool_calls")
+        self.assertTrue(body.endswith("data: [DONE]\n\n"))
+
+    @mock.patch("gemini_web2api.server.generate")
+    def test_chat_tool_loop_continues_with_correlated_results(self, generate):
+        generate.side_effect = [
+            '```client_operation\n{"name":"read","arguments":{"path":"a.txt"}}\n```',
+            '```tool_call\n{"name":"read","arguments":{"path":"b.txt"}}\n```',
+            "Both files checked.",
+        ]
+        tools = [{"type": "function", "function": {
+            "name": "read", "parameters": {"type": "object"}
+        }}]
+        messages = [{"role": "user", "content": "Check both files"}]
+        for index in range(2):
+            status, _, body = self.post_json("/v1/chat/completions", {
+                "model": "gemini-3.6-flash", "messages": messages,
+                "tools": tools, "stream": True,
+            })
+            self.assertEqual(status, 200)
+            chunk = json.loads(body.splitlines()[0][len("data: "):])
+            choice = chunk["choices"][0]
+            self.assertEqual(choice["finish_reason"], "tool_calls")
+            call = dict(choice["delta"]["tool_calls"][0])
+            self.assertEqual(call.pop("index"), 0)
+            messages.append({"role": "assistant", "content": None, "tool_calls": [call]})
+            messages.append({"role": "tool", "tool_call_id": call["id"],
+                             "content": f"file-{index}-contents"})
+        status, _, body = self.post_json("/v1/chat/completions", {
+            "model": "gemini-3.6-flash", "messages": messages, "tools": tools,
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["choices"][0]["finish_reason"], "stop")
+        self.assertEqual(generate.call_count, 3)
+        prompt = generate.call_args.args[0]
+        for message in messages:
+            if message["role"] == "tool":
+                self.assertIn(f"[Tool result for read (call_id={message['tool_call_id']})]", prompt)
+                self.assertIn(message["content"], prompt)
+
+    @mock.patch("gemini_web2api.server.generate", return_value="Result checked.")
+    def test_responses_preserves_top_level_function_call_history(self, generate):
+        status, _, body = self.post_json("/v1/responses", {
+            "model": "gemini-3.6-flash",
+            "input": [
+                {"role": "user", "content": "Check the file"},
+                {"type": "function_call", "call_id": "call_read", "name": "read",
+                 "arguments": '{"path":"a.txt"}'},
+                {"type": "function_call_output", "call_id": "call_read", "output": "file contents"},
+            ],
+        })
+        self.assertEqual(status, 200)
+        prompt = generate.call_args.args[0]
+        self.assertIn('"name": "read"', prompt)
+        self.assertIn('[Tool result for read (call_id=call_read)]: file contents', prompt)
+        self.assertEqual(json.loads(body)["status"], "completed")
+
+    @mock.patch("gemini_web2api.server.generate_stream")
+    def test_chat_stream_reports_upstream_error(self, generate_stream):
+        def interrupted():
+            yield "partial"
+            raise RuntimeError("connection interrupted")
+
+        generate_stream.return_value = interrupted()
+        status, _, body = self.post_json(
+            "/v1/chat/completions",
+            {
+                "model": "gemini-3.6-flash",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            },
+        )
+
+        self.assertEqual(status, 200)
+        self.assertIn('"type": "upstream_stream_error"', body)
+        self.assertIn('"retryable": false', body)
         self.assertTrue(body.endswith("data: [DONE]\n\n"))
 
     @mock.patch("gemini_web2api.server.generate", return_value="chunked ok")

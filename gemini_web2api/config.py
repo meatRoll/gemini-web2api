@@ -6,14 +6,22 @@ DEFAULT_CONFIG = {
     "port": 8081,
     "host": "0.0.0.0",
     "retry_attempts": 3,
-    "retry_delay_sec": 2,
-    "request_timeout_sec": 180,
+    "retry_delay_sec": 5,
+    "retry_delay_max_sec": 30,
+    "request_timeout_sec": 300,
+    "stream_heartbeat_sec": 10,
+    "agent_request_budget_sec": 300,
     "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
     "auth_user": None,
     "xsrf_token": None,
     "default_model": "gemini-3.6-flash",
     "log_requests": True,
+    "log_file": None,
+    "log_max_bytes": 2 * 1024 * 1024,
+    "log_backup_count": 2,
     "cookie_file": None,
+    "client_allowlist_file": None,
+    "cookie_rotation_interval_sec": 0,
     "proxy": None,
     "cache_db_path": "./gemini-web2api-cache.sqlite3",
     "cache_default_ttl_sec": 3600,
@@ -28,13 +36,18 @@ CONFIG = dict(DEFAULT_CONFIG)
 
 _ENV_KEYS = {
     "PORT": "port", "HOST": "host", "COOKIE_FILE": "cookie_file",
+    "CLIENT_ALLOWLIST_FILE": "client_allowlist_file",
     "PROXY": "proxy", "GEMINI_BL": "gemini_bl", "XSRF_TOKEN": "xsrf_token",
     "AUTH_USER": "auth_user", "DEFAULT_MODEL": "default_model",
     "API_KEYS": "api_keys", "LOG_REQUESTS": "log_requests",
     "TEMPORARY_CHATS": "temporary_chats", "RETRY_ATTEMPTS": "retry_attempts",
-    "RETRY_DELAY_SEC": "retry_delay_sec", "REQUEST_TIMEOUT_SEC": "request_timeout_sec",
+    "RETRY_DELAY_SEC": "retry_delay_sec", "RETRY_DELAY_MAX_SEC": "retry_delay_max_sec",
+    "REQUEST_TIMEOUT_SEC": "request_timeout_sec",
+    "AGENT_REQUEST_BUDGET_SEC": "agent_request_budget_sec",
+    "STREAM_HEARTBEAT_SEC": "stream_heartbeat_sec",
+    "COOKIE_ROTATION_INTERVAL_SEC": "cookie_rotation_interval_sec",
 }
-_ENV_INT = {"port", "retry_attempts", "retry_delay_sec", "request_timeout_sec"}
+_ENV_INT = {"port", "retry_attempts", "retry_delay_sec", "retry_delay_max_sec", "request_timeout_sec", "agent_request_budget_sec", "stream_heartbeat_sec", "cookie_rotation_interval_sec"}
 _ENV_BOOL = {"log_requests", "temporary_chats"}
 _ENV_NULLABLE = {"cookie_file", "proxy", "xsrf_token", "auth_user"}
 
