@@ -15,6 +15,8 @@
     "sk-gemini"
   ],
   "cookie_file": null,
+  "model_check_interval_sec": 0,
+  "model_snapshot_file": "./gemini-models.json",
   "proxy": null,
   "cache_db_path": "./gemini-web2api-cache.sqlite3",
   "cache_default_ttl_sec": 3600,

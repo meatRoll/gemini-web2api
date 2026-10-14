@@ -43,8 +43,8 @@ def _rotate_log_file(path: str, max_bytes: int, backup_count: int) -> None:
         pass
 
 
-def log(msg: str):
-    if not CONFIG["log_requests"]:
+def log(msg: str, force: bool = False):
+    if not force and not CONFIG["log_requests"]:
         return
     line = f"[{time.strftime('%H:%M:%S')}] {msg}\n"
     path = CONFIG.get("log_file")
