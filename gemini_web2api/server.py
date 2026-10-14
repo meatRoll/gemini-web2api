@@ -1,18 +1,89 @@
 """HTTP server: OpenAI-compatible API endpoints."""
+import ipaddress
 import json
+import os
 import time
 import uuid
 import re
+import select
+import socket
+import threading
+import queue
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
 from .config import CONFIG
 from .models import MODELS, resolve_model
 from .gemini import generate, generate_stream, log, _session_hash
+from .tools import has_tool_call_marker, valid_tool_call_candidate, validate_tool_calls
 from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
 from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
 from .cache import CACHE
+from .rotation import rotation_worker_alive
 from . import __version__
+
+
+_agent_slot = threading.BoundedSemaphore(1)
+
+
+_allowlist_cache = {"path": None, "mtime": 0, "ips": frozenset()}
+
+
+def _client_allowed(handler) -> bool:
+    path = CONFIG.get("client_allowlist_file")
+    if not path:
+        return True
+    client_ip = handler.client_address[0]
+    if client_ip in ("127.0.0.1", "::1"):
+        forwarded_ip = handler.headers.get("CF-Connecting-IP", "").strip()
+        if forwarded_ip:
+            try:
+                client_ip = str(ipaddress.ip_address(forwarded_ip))
+            except ValueError:
+                return False
+        else:
+            return True
+    try:
+        mtime = os.path.getmtime(path)
+        if path != _allowlist_cache["path"] or mtime != _allowlist_cache["mtime"]:
+            with open(path, encoding="utf-8") as source:
+                data = json.load(source)
+            ips = frozenset(str(ipaddress.ip_address(value)) for value in data.get("ips", []))
+            _allowlist_cache.update(path=path, mtime=mtime, ips=ips)
+        return client_ip in _allowlist_cache["ips"]
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+
+
+def _is_upstream_placeholder_refusal(text: str) -> bool:
+    """Recognize Gemini overload/fallback text before it contaminates history."""
+    normalized = " ".join((text or "").lower().split())
+    if not normalized or len(normalized) > 240:
+        return False
+    markers = (
+        "i couldn't do that because i'm getting a lot of requests right now. please try again later.",
+        "i'm having a hard time fulfilling your request. can i help you with something else instead?",
+        "sorry, something went wrong. please try your request again.",
+        "i seem to be encountering an error. can i try something else for you?",
+        "i encountered an error doing what you asked. please try again.",
+    )
+    return normalized in markers
+
+
+def _has_complete_tool_call(text: str) -> bool:
+    return valid_tool_call_candidate(text)
+
+
+def _classify_response_quality(prompt: str, text: str, tools: bool) -> str:
+    """Classify common upstream failures without another model request."""
+    context_class = "oversized_context" if len(prompt or "") > 60000 else ""
+    if tools and _is_upstream_placeholder_refusal(text):
+        return "temporary_refusal"
+    if tools and has_tool_call_marker(text):
+        return "normal" if _has_complete_tool_call(text) else "malformed_or_unparsed_tool_call"
+    if not (text or "").strip():
+        return "empty_response"
+    return context_class or "normal"
 
 
 def _usage(prompt: str, text: str) -> dict:
@@ -69,12 +140,70 @@ def _upload_images(images: list) -> list:
     return file_refs if file_refs else None
 
 
+def _stream_with_heartbeat(upstream):
+    """Yield upstream deltas while keeping idle SSE connections active.
+
+    Some Serv00/front-door proxies close an otherwise healthy stream after about
+    30 seconds without bytes.  Run the blocking upstream iterator separately so
+    the HTTP handler can emit SSE comments while Gemini is still preparing the
+    first token.
+    """
+    events = queue.Queue(maxsize=16)
+    stopped = threading.Event()
+
+    def publish(event):
+        while not stopped.is_set():
+            try:
+                events.put(event, timeout=0.5)
+                return
+            except queue.Full:
+                continue
+
+    def consume():
+        try:
+            for item in upstream:
+                if stopped.is_set():
+                    break
+                publish(("item", item))
+        except Exception as error:
+            publish(("error", error))
+        finally:
+            close = getattr(upstream, "close", None)
+            if close:
+                close()
+            publish(("done", None))
+
+    threading.Thread(target=consume, daemon=True).start()
+    interval = max(0.01, float(CONFIG.get("stream_heartbeat_sec", 10)))
+    try:
+        while True:
+            try:
+                kind, value = events.get(timeout=interval)
+            except queue.Empty:
+                yield None
+                continue
+            if kind == "item":
+                yield value
+            elif kind == "error":
+                raise value
+            else:
+                return
+    finally:
+        stopped.set()
+
+
 class GeminiHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         client_ip = self.client_address[0] if self.client_address else "-"
         log(f"{client_ip} {fmt % args}")
 
     def send_json(self, data, status=200):
+        if getattr(self, "_sse_started", False):
+            self.wfile.write(f"data: {json.dumps(data, ensure_ascii=False)}\n\n".encode())
+            if self.path == "/v1/chat/completions":
+                self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+            return
         body = json.dumps(data, ensure_ascii=False).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -83,12 +212,52 @@ class GeminiHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _client_disconnected(self):
+        readable, _, _ = select.select([self.connection], [], [], 0)
+        if not readable:
+            return False
+        try:
+            return self.connection.recv(1, socket.MSG_PEEK) == b""
+        except OSError:
+            return True
+
+    def _generate_buffered(self, prompt, model_id, think_mode, file_refs,
+                           extra_fields, model_name, request_id, tools_enabled):
+        kwargs = {"session_hash": _session_hash(model_name), "request_id": request_id}
+        if not tools_enabled:
+            return generate(prompt, model_id, think_mode, file_refs, extra_fields, **kwargs)
+        if not _agent_slot.acquire(blocking=False):
+            raise BlockingIOError("Another agent generation is still running; retry later")
+        try:
+            return generate(prompt, model_id, think_mode, file_refs, extra_fields,
+                            **kwargs, budget_sec=max(1, CONFIG["agent_request_budget_sec"]),
+                            max_attempts=1, cancelled=self._client_disconnected)
+        finally:
+            _agent_slot.release()
+
     def _start_sse(self):
+        if getattr(self, "_sse_started", False):
+            return
+        self._sse_started = True
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Cache-Control", "no-cache, no-transform")
+        self.send_header("X-Accel-Buffering", "no")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
+
+    def _wait_with_heartbeat(self, operation):
+        self._start_sse()
+
+        def result():
+            yield operation()
+
+        for value in _stream_with_heartbeat(result()):
+            if value is None:
+                self.wfile.write(b": keep-alive\n\n")
+                self.wfile.flush()
+            else:
+                return value
 
     def _parse_body(self, body: bytes) -> dict:
         try:
@@ -122,6 +291,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         return self.rfile.read(length) if length else b""
 
+    def _access_allowed(self):
+        if not _client_allowed(self):
+            self.send_json({"error": {"message": "client IP is not allowed"}}, 403)
+            return False
+        return True
+
     def _authorized(self):
         keys = CONFIG.get("api_keys") or []
         if not keys:
@@ -150,6 +325,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         try:
+            if not self._access_allowed():
+                return
             if self.path.startswith("/v1") and not self._authorized():
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
@@ -173,14 +350,20 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     for n, c in MODELS.items()
                 ]})
             elif self.path == "/":
-                self.send_json({"status": "ok", "version": __version__, "models": list(MODELS.keys())})
+                healthy = rotation_worker_alive()
+                self.send_json({"status": "ok" if healthy else "unhealthy",
+                                "version": __version__, "models": list(MODELS.keys())},
+                               200 if healthy else 503)
             else:
                 self.send_json({"error": "not found"}, 404)
         except (BrokenPipeError, ConnectionResetError):
             pass
 
     def do_POST(self):
+        self._sse_started = False
         try:
+            if not self._access_allowed():
+                return
             if self.path.startswith("/v1") and not self._authorized():
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
@@ -209,6 +392,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         if not self.path.startswith("/v1/caches/"):
             self.send_json({"error": "not found"}, 404)
+            return
+        if not _client_allowed(self):
+            self.send_json({"error": {"message": "client IP is not allowed"}}, 403)
             return
         if not self._authorized():
             self.send_json({"error": {"message": "invalid api key"}}, 401)
@@ -269,6 +455,13 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         stream = req.get("stream", False)
         cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+        started_at = time.monotonic()
+        log(
+            f"request_start id={cid} endpoint=chat model={model_name} "
+            f"request_bytes={len(body)} prompt_chars={len(prompt)} "
+            f"prompt_tokens_est={len(prompt)//4} stream={bool(stream)} "
+            f"tools={bool(req.get('tools'))}"
+        )
         try:
             file_refs = _upload_images(images)
         except RuntimeError as e:
@@ -292,7 +485,11 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self.wfile.write(f"data: {json.dumps(first_chunk)}\n\n".encode())
                 self.wfile.flush()
                 stream_text = ""
-                for delta in generate_stream(prompt, model_id, think_mode, file_refs, extra_fields, session_hash=_session_hash(model_name)):
+                for delta in _stream_with_heartbeat(generate_stream(prompt, model_id, think_mode, file_refs, extra_fields, session_hash=_session_hash(model_name), request_id=cid)):
+                    if delta is None:
+                        self.wfile.write(b": keep-alive\n\n")
+                        self.wfile.flush()
+                        continue
                     stream_text += delta
                     chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                              "model": model_name, "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}]}
@@ -311,21 +508,82 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self.wfile.write(f"data: {json.dumps(usage_chunk)}\n\n".encode())
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
+                log(
+                    f"request_finish id={cid} endpoint=chat status=ok "
+                    f"duration_ms={int((time.monotonic() - started_at) * 1000)} "
+                    f"output_chars={len(stream_text)} output_tokens_est={len(stream_text)//4}"
+                )
             except (BrokenPipeError, ConnectionResetError):
-                pass
+                log(
+                    f"request_finish id={cid} endpoint=chat status=client_disconnect "
+                    f"duration_ms={int((time.monotonic() - started_at) * 1000)} "
+                    f"output_chars={len(stream_text)}"
+                )
             except Exception as e:
-                log(f"Stream error: {e}")
+                error = str(e).replace("\n", " ")[:500]
+                log(
+                    f"request_finish id={cid} endpoint=chat status=error "
+                    f"duration_ms={int((time.monotonic() - started_at) * 1000)} "
+                    f"output_chars={len(stream_text)} error={error}"
+                )
+                try:
+                    error_event = {"error": {
+                        "type": "upstream_stream_error",
+                        "message": "upstream stream interrupted",
+                        "request_id": cid,
+                        "retryable": not bool(stream_text),
+                    }}
+                    self.wfile.write(f"data: {json.dumps(error_event)}\n\n".encode())
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
             return
 
         try:
-            text = generate(prompt, model_id, think_mode, file_refs, extra_fields, session_hash=_session_hash(model_name))
+            operation = lambda: self._generate_buffered(prompt, model_id, think_mode, file_refs, extra_fields, model_name, cid, bool(tools) and tool_choice != "none")
+            text = self._wait_with_heartbeat(operation) if stream else operation()
         except Exception as e:
-            self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+            error = str(e).replace("\n", " ")[:500]
+            log(
+                f"request_finish id={cid} endpoint=chat status=error "
+                f"duration_ms={int((time.monotonic() - started_at) * 1000)} error={error}"
+            )
+            self.send_json({"error": {"message": f"upstream error: {e}", "request_id": cid,
+                                     "retryable": True}},
+                           503 if isinstance(e, BlockingIOError) else 504 if isinstance(e, TimeoutError) else 502)
+            return
+
+        quality = _classify_response_quality(prompt, text, bool(tools) and tool_choice != "none")
+        log(f"response_quality id={cid} category={quality} prompt_chars={len(prompt)} output_chars={len(text or '')}")
+        if quality == "malformed_or_unparsed_tool_call":
+            log(f"request_finish id={cid} endpoint=chat status=tool_parse_error")
+            self.send_json({"error": {
+                "type": "tool_call_parse_error",
+                "message": "Gemini returned an incomplete or malformed tool_call",
+                "request_id": cid,
+                "retryable": True,
+            }}, 502)
+            return
+        if quality == "temporary_refusal":
+            log(f"request_finish id={cid} endpoint=chat status=temporary_refusal")
+            self.send_json({"error": {
+                "type": "upstream_temporary_refusal",
+                "message": "Gemini returned a temporary refusal; retry the current task",
+                "request_id": cid,
+                "retryable": True,
+            }}, 503)
             return
 
         tool_calls = None
         if tools and text and tool_choice != "none":
             text, tool_calls = parse_tool_calls(text)
+            try:
+                validate_tool_calls(tool_calls, tools)
+            except ValueError as e:
+                self.send_json({"error": {"type": "tool_call_parse_error", "message": str(e),
+                                          "request_id": cid, "retryable": True}}, 502)
+                return
         msg = {"role": "assistant", "content": text or None}
         if tool_calls:
             msg["tool_calls"] = tool_calls
@@ -333,8 +591,15 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         if stream:
             self._start_sse()
+            # OpenAI streaming clients correlate calls using the delta index.
+            delta = {"role": "assistant", "content": text or None}
+            if tool_calls:
+                delta["tool_calls"] = [
+                    {**tc, "index": index}
+                    for index, tc in enumerate(tool_calls)
+                ]
             chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
-                     "model": model_name, "choices": [{"index": 0, "delta": msg, "finish_reason": finish}]}
+                     "model": model_name, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
             self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
             usage_chunk = {
                 "id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
@@ -346,6 +611,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.wfile.write(f"data: {json.dumps(usage_chunk)}\n\n".encode())
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
+            log(
+                f"request_finish id={cid} endpoint=chat status=ok "
+                f"duration_ms={int((time.monotonic() - started_at) * 1000)} "
+                f"output_chars={len(text or '')} output_tokens_est={len(text or '')//4} "
+                f"finish={finish} short_output={len(text or '') < 200} buffered_for_tools=true"
+            )
         else:
             self.send_json({
                 "id": cid, "object": "chat.completion", "created": int(time.time()),
@@ -355,6 +626,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
                           "total_tokens": (len(prompt)+len(text or ""))//4,
                           "prompt_tokens_details": {"cached_tokens": cached_tokens}},
             })
+            log(
+                f"request_finish id={cid} endpoint=chat status=ok "
+                f"duration_ms={int((time.monotonic() - started_at) * 1000)} "
+                f"output_chars={len(text or '')} output_tokens_est={len(text or '')//4} "
+                f"finish={finish} short_output={len(text or '') < 200}"
+            )
 
     # ─── /v1/responses (Codex CLI) ───────────────────────────────────────────
 
@@ -384,6 +661,18 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     if item.get("type") == "function_call_output":
                         messages.append({"role": "tool", "tool_call_id": item.get("call_id", ""),
                                          "name": item.get("name", ""), "content": item.get("output", "")})
+                    elif item.get("type") == "function_call":
+                        messages.append({
+                            "role": "assistant", "content": None,
+                            "tool_calls": [{
+                                "id": item.get("call_id", item.get("id", "")),
+                                "type": "function",
+                                "function": {
+                                    "name": item.get("name", ""),
+                                    "arguments": item.get("arguments", "{}"),
+                                },
+                            }],
+                        })
                     elif item.get("type") in ("input_text", "input_image", "image"):
                         messages.append({"role": "user", "content": [item]})
                     elif item.get("role") == "assistant" or (item.get("type") == "message" and item.get("role") == "assistant"):
@@ -434,18 +723,59 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": "empty input"}}, 400)
             return
 
+        rid = f"resp_{uuid.uuid4().hex[:16]}"
+        started_at = time.monotonic()
+        log(
+            f"request_start id={rid} endpoint=responses model={model_name} "
+            f"request_bytes={len(body)} prompt_chars={len(prompt)} "
+            f"prompt_tokens_est={len(prompt)//4} stream={bool(req.get('stream'))} "
+            f"tools={bool(tools)}"
+        )
         try:
             file_refs = _upload_images(images)
-            text = generate(prompt, model_id, think_mode, file_refs, extra_fields, session_hash=_session_hash(model_name))
+            operation = lambda: self._generate_buffered(prompt, model_id, think_mode, file_refs, extra_fields, model_name, rid, bool(tools) and tool_choice != "none")
+            text = self._wait_with_heartbeat(operation) if req.get("stream") else operation()
         except Exception as e:
-            self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+            error = str(e).replace("\n", " ")[:500]
+            log(
+                f"request_finish id={rid} endpoint=responses status=error "
+                f"duration_ms={int((time.monotonic() - started_at) * 1000)} error={error}"
+            )
+            self.send_json({"error": {"message": f"upstream error: {e}", "request_id": rid,
+                                     "retryable": True}},
+                           503 if isinstance(e, BlockingIOError) else 504 if isinstance(e, TimeoutError) else 502)
+            return
+
+        quality = _classify_response_quality(prompt, text, bool(tools) and tool_choice != "none")
+        log(f"response_quality id={rid} category={quality} prompt_chars={len(prompt)} output_chars={len(text or '')}")
+        if quality == "malformed_or_unparsed_tool_call":
+            log(f"request_finish id={rid} endpoint=responses status=tool_parse_error")
+            self.send_json({"error": {
+                "type": "tool_call_parse_error",
+                "message": "Gemini returned an incomplete or malformed tool_call",
+                "request_id": rid,
+                "retryable": True,
+            }}, 502)
+            return
+        if quality == "temporary_refusal":
+            log(f"request_finish id={rid} endpoint=responses status=temporary_refusal")
+            self.send_json({"error": {
+                "type": "upstream_temporary_refusal",
+                "message": "Gemini returned a temporary refusal; retry the current task",
+                "request_id": rid,
+                "retryable": True,
+            }}, 503)
             return
 
         tool_calls = None
         if tools and text and tool_choice != "none":
             text, tool_calls = parse_tool_calls(text)
-
-        rid = f"resp_{uuid.uuid4().hex[:16]}"
+            try:
+                validate_tool_calls(tool_calls, tools)
+            except ValueError as e:
+                self.send_json({"error": {"type": "tool_call_parse_error", "message": str(e),
+                                          "request_id": rid, "retryable": True}}, 502)
+                return
         mid = f"msg_{uuid.uuid4().hex[:12]}"
         output = []
         if tool_calls:
@@ -592,12 +922,22 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 },
             )
             self.wfile.flush()
+            log(
+                f"request_finish id={rid} endpoint=responses status=ok "
+                f"duration_ms={int((time.monotonic() - started_at) * 1000)} "
+                f"output_chars={len(text or '')} output_tokens_est={len(text or '')//4}"
+            )
         else:
             self.send_json({"id": rid, "object": "response", "created_at": int(time.time()), "status": "completed",
                             "model": model_name, "output": output,
                             "usage": {"input_tokens": len(prompt)//4, "output_tokens": len(text or "")//4,
                                       "total_tokens": (len(prompt)+len(text or ""))//4,
                                       "input_tokens_details": {"cached_tokens": cached_tokens}}})
+            log(
+                f"request_finish id={rid} endpoint=responses status=ok "
+                f"duration_ms={int((time.monotonic() - started_at) * 1000)} "
+                f"output_chars={len(text or '')} output_tokens_est={len(text or '')//4}"
+            )
 
     # ─── /v1beta/models (Google Gemini CLI) ──────────────────────────────────
 
@@ -632,8 +972,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
             try:
                 self._start_sse()
                 full_text = ""
-                for delta in generate_stream(prompt, model_id, think_mode, file_refs, extra_fields, session_hash=_session_hash(model_name)):
-                    if not delta:
+                for delta in _stream_with_heartbeat(generate_stream(prompt, model_id, think_mode, file_refs, extra_fields, session_hash=_session_hash(model_name), request_id=f"google-{uuid.uuid4().hex[:10]}")):
+                    if delta is None:
+                        self.wfile.write(b": keep-alive\n\n")
+                        self.wfile.flush()
                         continue
                     full_text += delta
                     chunk_obj = {
@@ -660,7 +1002,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            text = generate(prompt, model_id, think_mode, file_refs, extra_fields, session_hash=_session_hash(model_name))
+            operation = lambda: generate(prompt, model_id, think_mode, file_refs, extra_fields, session_hash=_session_hash(model_name), request_id=f"google-{uuid.uuid4().hex[:10]}")
+            text = self._wait_with_heartbeat(operation) if stream else operation()
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
