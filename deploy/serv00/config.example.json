@@ -1,0 +1,13 @@
+{
+  "host": "127.0.0.1",
+  "port": 8081,
+  "request_timeout_sec": 300,
+  "agent_request_budget_sec": 300,
+  "stream_heartbeat_sec": 10,
+  "cookie_file": null,
+  "client_allowlist_file": null,
+  "cookie_rotation_interval_sec": 0,
+  "api_keys": [],
+  "log_requests": false,
+  "cache_db_path": "./gemini-web2api-cache.sqlite3"
+}

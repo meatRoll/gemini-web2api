@@ -5,6 +5,7 @@ import os
 from .config import CONFIG, load_config, load_env, find_config
 from .models import MODELS
 from .gemini import HAS_HTTPX
+from .rotation import start_cookie_rotation
 from .server import GeminiHandler, ThreadedServer
 from . import __version__
 
@@ -36,6 +37,7 @@ def main():
 
     port = CONFIG["port"]
     server = ThreadedServer((CONFIG["host"], port), GeminiHandler)
+    start_cookie_rotation()
     print(f"gemini-web2api v{__version__}")
     if env_file:
         print(f"  Env file:  {env_file}")
