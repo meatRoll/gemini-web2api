@@ -13,7 +13,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
 from .config import CONFIG
-from .models import MODELS, resolve_model
+from .models import get_models, resolve_model
 from .gemini import generate, generate_stream, log, _session_hash
 from .tools import has_tool_call_marker, valid_tool_call_candidate, validate_tool_calls
 from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
@@ -334,7 +334,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self.send_json({"object": "list", "data": [
                     {"id": n, "object": "model", "created": 1700000000,
                      "owned_by": "google", "description": c["desc"]}
-                     for n, c in MODELS.items()
+                     for n, c in get_models().items()
                 ]})
             elif self.path.startswith("/v1/caches/"):
                 cache_id = self.path.rsplit("/", 1)[-1]
@@ -347,12 +347,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self.send_json({"models": [
                     {"name": f"models/{n}", "displayName": n, "description": c["desc"],
                      "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]}
-                    for n, c in MODELS.items()
+                    for n, c in get_models().items()
                 ]})
             elif self.path == "/":
                 healthy = rotation_worker_alive()
                 self.send_json({"status": "ok" if healthy else "unhealthy",
-                                "version": __version__, "models": list(MODELS.keys())},
+                                "version": __version__, "models": list(get_models().keys())},
                                200 if healthy else 503)
             else:
                 self.send_json({"error": "not found"}, 404)
