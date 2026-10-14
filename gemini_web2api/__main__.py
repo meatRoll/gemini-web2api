@@ -3,7 +3,7 @@ import argparse
 import os
 
 from .config import CONFIG, load_config, load_env, find_config
-from .models import MODELS
+from .models import get_models
 from .gemini import HAS_HTTPX
 from .rotation import start_cookie_rotation
 from .model_monitor import start_model_monitor, stop_model_monitor
@@ -45,7 +45,7 @@ def main():
         print(f"  Env file:  {env_file}")
     print(f"  Listening: http://0.0.0.0:{port}")
     print(f"  Base URL:  http://localhost:{port}/v1")
-    print(f"  Models:    {', '.join(MODELS.keys())}")
+    print(f"  Models:    {', '.join(get_models().keys())}")
     print(f"  Cookie:    {'yes' if CONFIG.get('cookie_file') else 'none (anonymous)'}")
     print(f"  Proxy:     {CONFIG.get('proxy') or 'system env'}")
     print(f"  Streaming: {'httpx (true streaming)' if HAS_HTTPX else 'urllib (buffered)'}")
