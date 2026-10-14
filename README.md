@@ -284,18 +284,21 @@ account's model list. Add these settings to the cookie instance's configuration:
 
 ```json
 {
-  "model_check_interval_sec": 21600,
+  "model_check_interval_sec": 86400,
   "model_snapshot_file": "./gemini-models.json",
   "log_file": "logs/service.log"
 }
 ```
 
-The feature is disabled by default (`0`). When enabled, it waits 60 seconds after
-startup, then makes one `otAQ7b` model-list request when due. It sends no generation
-requests, follows no redirects, and does not retry within a check. The minimum
-interval is 3600 seconds; 21600 seconds (six hours) is recommended. Failed checks
-also respect the interval, and the last attempt survives service restarts. The
-configured proxy is used; without one, this check connects directly.
+With an authentication export configured, the default interval is 86400 seconds
+(one day); set it to `0` to disable monitoring. On the first start, with no saved
+attempt, it immediately reads the model list and uses that attempt as the start
+of the daily cycle. Later starts respect the saved schedule and do not force an
+extra request. Each due check makes one `otAQ7b` model-list request, sends no
+generation requests, follows no redirects, and does not retry within a check.
+The minimum interval is 3600 seconds. Failed checks also respect the interval,
+and the last attempt survives service restarts. The configured proxy is used;
+without one, this check connects directly.
 
 A current authentication export with a session cookie and XSRF token is required.
 The first successful read establishes a baseline. Subsequent reads compare stable
