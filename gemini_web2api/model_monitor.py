@@ -320,12 +320,15 @@ def start_model_monitor():
     _stop_event.clear()
 
     def run():
-        # Leave startup quiet; persisted attempt times also survive restarts.
-        while not _stop_event.wait(60):
+        # Establish the initial baseline immediately; saved attempts keep
+        # subsequent restarts on the existing schedule.
+        while not _stop_event.is_set():
             try:
                 check_models_once()
             except Exception as error:
                 log("model_check status=state_error type=" + type(error).__name__, force=True)
+            if _stop_event.wait(60):
+                break
 
     _monitor_thread = threading.Thread(target=run, name="model-monitor", daemon=True)
     _monitor_thread.start()

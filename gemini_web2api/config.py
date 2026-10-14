@@ -22,7 +22,7 @@ DEFAULT_CONFIG = {
     "cookie_file": None,
     "client_allowlist_file": None,
     "cookie_rotation_interval_sec": 0,
-    "model_check_interval_sec": 0,
+    "model_check_interval_sec": 86400,
     "model_snapshot_file": "./gemini-models.json",
     "proxy": None,
     "cache_db_path": "./gemini-web2api-cache.sqlite3",
