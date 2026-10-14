@@ -136,7 +136,8 @@ def _account_prefix() -> str:
     return f"/u/{auth_user}"
 
 
-def _build_headers(session_hash: str = None) -> dict:
+def _build_headers(session_hash=None) -> dict:
+    cookie_str, sapisid = load_cookie()
     account_prefix = _account_prefix()
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
@@ -147,15 +148,19 @@ def _build_headers(session_hash: str = None) -> dict:
     }
     if account_prefix:
         headers["X-Goog-AuthUser"] = str(CONFIG["auth_user"])
-    cookie_str, sapisid = load_cookie()
     if cookie_str:
         headers["Cookie"] = cookie_str
     if sapisid:
         headers["Authorization"] = make_sapisidhash(sapisid)
-    if session_hash:
-        # ponytail: x-goog-ext-525001261-jspb idx4 hash binds the request to the
-        # model the user picked in the web UI (payload [79] is ignored upstream).
-        # Server-side state, may expire with the web session; re-capture then.
+    if isinstance(session_hash, dict):
+        from .model_monitor import _scope
+        if session_hash["scope"] != _scope(cookie_str, CONFIG.get("auth_user")):
+            raise RuntimeError("Model selection belongs to a different session; refresh the model snapshot")
+        headers["x-goog-ext-525001261-jspb"] = json.dumps(session_hash["header"])
+        headers["x-goog-ext-73010989-jspb"] = "[0]"
+        headers["x-goog-ext-73010990-jspb"] = "[0,0,0]"
+    elif session_hash:
+        # Compatibility with manually captured selection hashes.
         headers["x-goog-ext-525001261-jspb"] = json.dumps(
             [1, None, None, None, session_hash] + [None] * 13)
     return headers
@@ -201,7 +206,8 @@ def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list 
     inner[79] = model_id
     if extra_fields:
         for k, v in extra_fields.items():
-            inner[k] = v
+            if k != "_model_selection":
+                inner[k] = v
     outer = [None, json.dumps(inner)]
     params = {"f.req": json.dumps(outer)}
     if CONFIG.get("xsrf_token"):
@@ -339,7 +345,8 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
     load_cookie()
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
     url = _get_url()
-    headers = _build_headers(session_hash)
+    selection = (extra_fields or {}).get("_model_selection")
+    headers = _build_headers(selection if selection is not None else session_hash)
     ctx = _get_ssl_ctx()
     proxy = CONFIG.get("proxy")
 
@@ -429,7 +436,8 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
     load_cookie()
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields)
     url = _get_url()
-    headers = _build_headers(session_hash)
+    selection = (extra_fields or {}).get("_model_selection")
+    headers = _build_headers(selection if selection is not None else session_hash)
     client = _get_httpx_client()
 
     last_err = None

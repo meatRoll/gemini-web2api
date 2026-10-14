@@ -305,7 +305,16 @@ The first successful read establishes a baseline. Subsequent reads compare stabl
 model IDs and record additions, removals, renames, and metadata changes. Failed,
 empty, partial, or unauthenticated responses retain the last valid snapshot. A
 new account/session establishes a new baseline; routine TS/CC cookie rotation
-preserves it. Discovery does not update API model aliases or generation routing.
+preserves it. The modular `/v1/models` and `/v1beta/models` endpoints publish the
+current snapshot's model names, such as `gemini-4-argon`. Generation uses the
+snapshot's model ID, capacity and model number to build the complete selection
+header. Reading the list or resolving a model only reads local state; it makes no
+additional model-list requests. Snapshot changes take effect without a restart.
+Legacy aliases map to the available model in the same category. Unavailable
+Gemini names return an error instead of silently selecting another model.
+After an update, refresh the channel's model list in downstream services such as
+New API. If no valid snapshot for the current session exists, the legacy list is
+used and undiscovered Gemini names are rejected.
 
 The snapshot contains `snapshot.models`, `snapshot.checked_at`, `last_attempt_at`,
 `last_status`, and the latest change event in `last_change`. It stores a hashed
