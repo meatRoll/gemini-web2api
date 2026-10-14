@@ -7,6 +7,8 @@
   "cookie_file": null,
   "client_allowlist_file": null,
   "cookie_rotation_interval_sec": 0,
+  "model_check_interval_sec": 0,
+  "model_snapshot_file": "./gemini-models.json",
   "api_keys": [],
   "log_requests": false,
   "cache_db_path": "./gemini-web2api-cache.sqlite3"

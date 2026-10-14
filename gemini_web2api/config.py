@@ -22,6 +22,8 @@ DEFAULT_CONFIG = {
     "cookie_file": None,
     "client_allowlist_file": None,
     "cookie_rotation_interval_sec": 0,
+    "model_check_interval_sec": 0,
+    "model_snapshot_file": "./gemini-models.json",
     "proxy": None,
     "cache_db_path": "./gemini-web2api-cache.sqlite3",
     "cache_default_ttl_sec": 3600,
@@ -46,8 +48,10 @@ _ENV_KEYS = {
     "AGENT_REQUEST_BUDGET_SEC": "agent_request_budget_sec",
     "STREAM_HEARTBEAT_SEC": "stream_heartbeat_sec",
     "COOKIE_ROTATION_INTERVAL_SEC": "cookie_rotation_interval_sec",
+    "MODEL_CHECK_INTERVAL_SEC": "model_check_interval_sec",
+    "MODEL_SNAPSHOT_FILE": "model_snapshot_file",
 }
-_ENV_INT = {"port", "retry_attempts", "retry_delay_sec", "retry_delay_max_sec", "request_timeout_sec", "agent_request_budget_sec", "stream_heartbeat_sec", "cookie_rotation_interval_sec"}
+_ENV_INT = {"port", "retry_attempts", "retry_delay_sec", "retry_delay_max_sec", "request_timeout_sec", "agent_request_budget_sec", "stream_heartbeat_sec", "cookie_rotation_interval_sec", "model_check_interval_sec"}
 _ENV_BOOL = {"log_requests", "temporary_chats"}
 _ENV_NULLABLE = {"cookie_file", "proxy", "xsrf_token", "auth_user"}
 

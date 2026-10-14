@@ -11,3 +11,5 @@ cookie.json
 gemini-auth.json
 *.sqlite3
 *_freq.json
+gemini-models.json
+gemini-models.json.lock
