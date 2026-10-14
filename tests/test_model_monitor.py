@@ -140,6 +140,15 @@ class ModelMonitorTests(unittest.TestCase):
         # Each call reloads disk state, with no process-local schedule to reset.
         self.assertEqual(monitor.check_models_once(now=13601), "not_due")
 
+    def test_default_daily_cycle_survives_restart_without_extra_fetch(self):
+        CONFIG["model_check_interval_sec"] = DEFAULT_CONFIG["model_check_interval_sec"]
+        self.assertEqual(monitor.check_models_once(now=10000), "baseline")
+        self.assertEqual(monitor.check_models_once(now=10060), "not_due")
+        self.assertEqual(monitor.check_models_once(now=96399), "not_due")
+        self.assertEqual(monitor.check_models_once(now=96400), "unchanged")
+        self.assertEqual(self.fetch.call_count, 2)
+        self.assertEqual(self.state()["last_attempt_at"], 96400)
+
     def test_configured_six_hour_interval_is_respected(self):
         CONFIG["model_check_interval_sec"] = 21600
         monitor.check_models_once(now=10000)
@@ -239,20 +248,27 @@ class ModelMonitorTests(unittest.TestCase):
         load_env(env)
         self.assertEqual(CONFIG["model_check_interval_sec"], 21600)
         self.assertEqual(CONFIG["model_snapshot_file"], "./custom-models.json")
-        self.assertEqual(DEFAULT_CONFIG["model_check_interval_sec"], 0)
+        self.assertEqual(DEFAULT_CONFIG["model_check_interval_sec"], 86400)
         CONFIG["model_check_interval_sec"] = 0
         with mock.patch.object(monitor.threading, "Thread") as thread:
             monitor.start_model_monitor()
             thread.assert_not_called()
 
-    def test_worker_waits_before_check_and_avoids_duplicate_start(self):
+    def test_worker_checks_immediately_and_avoids_duplicate_start(self):
         with mock.patch.object(monitor, "_monitor_thread", None), \
              mock.patch.object(monitor.threading, "Thread") as thread, \
              mock.patch.object(monitor, "_stop_event") as stop:
             monitor.start_model_monitor()
             thread.assert_called_once()
             thread.return_value.start.assert_called_once()
+            stop.is_set.return_value = False
             stop.wait.side_effect = [False, True]
+
+            def fetch():
+                stop.wait.assert_not_called()
+                return result()
+
+            self.fetch.side_effect = fetch
             thread.call_args.kwargs["target"]()
             stop.wait.assert_has_calls([mock.call(60), mock.call(60)])
             self.fetch.assert_called_once()
