@@ -267,6 +267,41 @@ curl http://localhost:8082/v1/chat/completions \
 
 `api_keys` 为空数组 `[]` 时不校验密钥；填入一个或多个密钥后, `/v1/*` 接口需要 `Authorization: Bearer <key>` 或 `x-api-key: <key>`.
 
+### 模型变动检测
+
+模块版服务（`python -m gemini_web2api`）支持定期读取登录账号的模型列表。
+在带 Cookie 的实例配置中增加：
+
+```json
+{
+  "model_check_interval_sec": 21600,
+  "model_snapshot_file": "./gemini-models.json",
+  "log_file": "logs/service.log"
+}
+```
+
+默认值 `0` 表示关闭。启用后，启动时先等待 60 秒，达到检查时间时仅发送
+一次 `otAQ7b` 模型列表请求，不发送生成请求、不跟随重定向、不在单次检查中重试。
+最短检查间隔为 3600 秒，建议使用 21600 秒（6 小时）。失败也遵守检查间隔，
+检查时间会保存到磁盘，服务重启不会立即重复请求。配置了 `proxy` 时使用该代理，
+否则模型检查直接连接上游。
+
+需要包含有效会话 Cookie 和 XSRF token 的认证导出。首次成功读取建立基线，
+随后按稳定模型 ID 比较，记录新增、移除、改名和元数据更新。请求失败、空列表、
+不完整数据或未登录响应都保留上次有效快照。更换账号或会话会重新建立基线，
+常规 TS/CC Cookie 续期不会重置基线。此功能仅检测变化，不修改 API 模型别名或生成路由。
+
+快照中的 `snapshot.models` 保存模型信息，`snapshot.checked_at` 保存成功读取时间；
+`last_attempt_at`、`last_status` 保存最近检查状态，`last_change` 保留最近一次变动。
+文件只保存会话范围的哈希，不保存 Cookie、token 或原始 RPC 响应。
+Unix 上的快照和锁文件权限为 `0600`，快照采用原子写入。
+即使 `log_requests` 为 `false`，仍会输出 `model_check` 和 `model_change` 日志。
+状态文件损坏或无法写入时停止检查，修复文件后恢复。共享快照文件的进程通过系统锁
+串行检查；不同账号实例应使用不同快照路径，自定义路径也应加入 Git 忽略规则。
+
+对应的 `.env` 配置项为 `MODEL_CHECK_INTERVAL_SEC` 和 `MODEL_SNAPSHOT_FILE`。
+单文件 Python 版与 Cloudflare Worker 不启动此检测任务。
+
 ### 上下文缓存
 
 服务提供基于 SQLite 的本地上下文缓存。通过 `POST /v1/caches` 创建缓存，

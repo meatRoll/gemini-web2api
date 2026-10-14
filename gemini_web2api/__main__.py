@@ -6,6 +6,7 @@ from .config import CONFIG, load_config, load_env, find_config
 from .models import MODELS
 from .gemini import HAS_HTTPX
 from .rotation import start_cookie_rotation
+from .model_monitor import start_model_monitor, stop_model_monitor
 from .server import GeminiHandler, ThreadedServer
 from . import __version__
 
@@ -38,6 +39,7 @@ def main():
     port = CONFIG["port"]
     server = ThreadedServer((CONFIG["host"], port), GeminiHandler)
     start_cookie_rotation()
+    start_model_monitor()
     print(f"gemini-web2api v{__version__}")
     if env_file:
         print(f"  Env file:  {env_file}")
@@ -54,6 +56,9 @@ def main():
     except KeyboardInterrupt:
         print("\nStopped.")
         server.shutdown()
+    finally:
+        stop_model_monitor()
+        server.server_close()
 
 
 if __name__ == "__main__":

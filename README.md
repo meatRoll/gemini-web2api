@@ -277,6 +277,45 @@ persisting conversations to the account history.
 
 When `api_keys` is `[]`, authentication is disabled. When one or more keys are set, `/v1/*` endpoints require `Authorization: Bearer <key>` or `x-api-key: <key>`.
 
+### Model change monitoring
+
+The modular server (`python -m gemini_web2api`) can periodically read the signed-in
+account's model list. Add these settings to the cookie instance's configuration:
+
+```json
+{
+  "model_check_interval_sec": 21600,
+  "model_snapshot_file": "./gemini-models.json",
+  "log_file": "logs/service.log"
+}
+```
+
+The feature is disabled by default (`0`). When enabled, it waits 60 seconds after
+startup, then makes one `otAQ7b` model-list request when due. It sends no generation
+requests, follows no redirects, and does not retry within a check. The minimum
+interval is 3600 seconds; 21600 seconds (six hours) is recommended. Failed checks
+also respect the interval, and the last attempt survives service restarts. The
+configured proxy is used; without one, this check connects directly.
+
+A current authentication export with a session cookie and XSRF token is required.
+The first successful read establishes a baseline. Subsequent reads compare stable
+model IDs and record additions, removals, renames, and metadata changes. Failed,
+empty, partial, or unauthenticated responses retain the last valid snapshot. A
+new account/session establishes a new baseline; routine TS/CC cookie rotation
+preserves it. Discovery does not update API model aliases or generation routing.
+
+The snapshot contains `snapshot.models`, `snapshot.checked_at`, `last_attempt_at`,
+`last_status`, and the latest change event in `last_change`. It stores a hashed
+session scope, never cookies, tokens, or raw RPC responses. On Unix, snapshot and
+lock files are private (`0600`); writes are atomic. Model events are logged even
+when `log_requests` is false, using `model_check` and `model_change` entries.
+A corrupt or unwritable state file stops checks until repaired. Multiple processes
+sharing the same snapshot file serialize checks with an OS lock; use a different
+snapshot path for each account instance. Keep custom snapshot paths out of Git.
+
+Equivalent `.env` keys are `MODEL_CHECK_INTERVAL_SEC` and `MODEL_SNAPSHOT_FILE`.
+The standalone Python script and Cloudflare Worker do not start this monitor.
+
 ### Context Cache
 
 The proxy provides local SQLite-backed context caching. Create a cache with
