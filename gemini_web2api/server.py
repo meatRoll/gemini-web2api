@@ -14,7 +14,7 @@ from socketserver import ThreadingMixIn
 
 from .config import CONFIG
 from .models import get_models, resolve_model
-from .gemini import generate, generate_stream, log, _session_hash
+from .gemini import generate, generate_stream, log, _session_hash, safe_error_message
 from .tools import has_tool_call_marker, valid_tool_call_candidate, validate_tool_calls
 from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
 from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
@@ -246,7 +246,33 @@ class GeminiHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
 
-    def _wait_with_heartbeat(self, operation):
+    def _send_chat_stream_chunk(self, request_id, model_name, delta=None, finish_reason=None):
+        """Send a valid OpenAI SSE chunk, including empty chunks used as transport keepalive."""
+        chunk = {
+            "id": request_id,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model_name,
+            "choices": [{
+                "index": 0,
+                "delta": delta or {},
+                "finish_reason": finish_reason,
+            }],
+        }
+        self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
+        self.wfile.flush()
+
+    def _send_chat_stream_keepalive(self, request_id, model_name, initial=False):
+        self._send_chat_stream_chunk(
+            request_id,
+            model_name,
+            {"role": "assistant"} if initial else {},
+            None,
+        )
+        if not initial:
+            log(f"stream_keepalive id={request_id} model={model_name} kind=data_chunk")
+
+    def _wait_with_heartbeat(self, operation, heartbeat=None):
         self._start_sse()
 
         def result():
@@ -254,8 +280,11 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         for value in _stream_with_heartbeat(result()):
             if value is None:
-                self.wfile.write(b": keep-alive\n\n")
-                self.wfile.flush()
+                if heartbeat is None:
+                    self.wfile.write(b": keep-alive\n\n")
+                    self.wfile.flush()
+                else:
+                    heartbeat()
             else:
                 return value
 
@@ -454,13 +483,19 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         stream = req.get("stream", False)
+        tools_enabled = bool(tools) and tool_choice != "none"
+        request_budget = max(1, int(CONFIG.get("agent_request_budget_sec", 300))) if tools_enabled else None
+        request_attempts = 1 if tools_enabled else max(1, int(CONFIG.get("retry_attempts", 3)))
         cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         started_at = time.monotonic()
         log(
             f"request_start id={cid} endpoint=chat model={model_name} "
             f"request_bytes={len(body)} prompt_chars={len(prompt)} "
             f"prompt_tokens_est={len(prompt)//4} stream={bool(stream)} "
-            f"tools={bool(req.get('tools'))}"
+            f"tools={bool(req.get('tools'))} tools_enabled={tools_enabled} "
+            f"request_timeout_sec={int(CONFIG.get('request_timeout_sec', 300))} "
+            f"budget_sec={request_budget if request_budget is not None else 'none'} "
+            f"max_attempts={request_attempts}"
         )
         try:
             file_refs = _upload_images(images)
@@ -487,8 +522,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 stream_text = ""
                 for delta in _stream_with_heartbeat(generate_stream(prompt, model_id, think_mode, file_refs, extra_fields, session_hash=_session_hash(model_name), request_id=cid)):
                     if delta is None:
-                        self.wfile.write(b": keep-alive\n\n")
-                        self.wfile.flush()
+                        self._send_chat_stream_keepalive(cid, model_name)
                         continue
                     stream_text += delta
                     chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
@@ -520,10 +554,11 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     f"output_chars={len(stream_text)}"
                 )
             except Exception as e:
-                error = str(e).replace("\n", " ")[:500]
+                error = safe_error_message(e, 500)
                 log(
                     f"request_finish id={cid} endpoint=chat status=error "
                     f"duration_ms={int((time.monotonic() - started_at) * 1000)} "
+                    f"http_status=200_or_stream_error error_type={type(e).__name__} "
                     f"output_chars={len(stream_text)} error={error}"
                 )
                 try:
@@ -541,17 +576,29 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            operation = lambda: self._generate_buffered(prompt, model_id, think_mode, file_refs, extra_fields, model_name, cid, bool(tools) and tool_choice != "none")
-            text = self._wait_with_heartbeat(operation) if stream else operation()
+            operation = lambda: self._generate_buffered(prompt, model_id, think_mode, file_refs, extra_fields, model_name, cid, tools_enabled)
+            if stream:
+                self._start_sse()
+                self._send_chat_stream_keepalive(cid, model_name, initial=True)
+                log(f"stream_preamble id={cid} endpoint=chat kind=role_chunk")
+                text = self._wait_with_heartbeat(
+                    operation,
+                    heartbeat=lambda: self._send_chat_stream_keepalive(cid, model_name),
+                )
+            else:
+                text = operation()
         except Exception as e:
-            error = str(e).replace("\n", " ")[:500]
+            error = safe_error_message(e, 500)
+            status_code = 503 if isinstance(e, BlockingIOError) else 504 if isinstance(e, TimeoutError) else 502
             log(
                 f"request_finish id={cid} endpoint=chat status=error "
-                f"duration_ms={int((time.monotonic() - started_at) * 1000)} error={error}"
+                f"duration_ms={int((time.monotonic() - started_at) * 1000)} "
+                f"http_status={status_code} error_type={type(e).__name__} "
+                f"tools_enabled={tools_enabled} error={error}"
             )
-            self.send_json({"error": {"message": f"upstream error: {e}", "request_id": cid,
+            self.send_json({"error": {"message": f"upstream error: {error}", "request_id": cid,
                                      "retryable": True}},
-                           503 if isinstance(e, BlockingIOError) else 504 if isinstance(e, TimeoutError) else 502)
+                           status_code)
             return
 
         quality = _classify_response_quality(prompt, text, bool(tools) and tool_choice != "none")
@@ -591,8 +638,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         if stream:
             self._start_sse()
-            # OpenAI streaming clients correlate calls using the delta index.
-            delta = {"role": "assistant", "content": text or None}
+            # The preamble already established the assistant role for buffered streams.
+            delta = {"content": text or None}
             if tool_calls:
                 delta["tool_calls"] = [
                     {**tc, "index": index}
@@ -724,26 +771,34 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         rid = f"resp_{uuid.uuid4().hex[:16]}"
+        tools_enabled = bool(tools) and tool_choice != "none"
+        request_budget = max(1, int(CONFIG.get("agent_request_budget_sec", 300))) if tools_enabled else None
+        request_attempts = 1 if tools_enabled else max(1, int(CONFIG.get("retry_attempts", 3)))
         started_at = time.monotonic()
         log(
             f"request_start id={rid} endpoint=responses model={model_name} "
             f"request_bytes={len(body)} prompt_chars={len(prompt)} "
             f"prompt_tokens_est={len(prompt)//4} stream={bool(req.get('stream'))} "
-            f"tools={bool(tools)}"
+            f"tools={bool(tools)} tools_enabled={tools_enabled} "
+            f"request_timeout_sec={int(CONFIG.get('request_timeout_sec', 300))} "
+            f"budget_sec={request_budget if request_budget is not None else 'none'} "
+            f"max_attempts={request_attempts}"
         )
         try:
             file_refs = _upload_images(images)
-            operation = lambda: self._generate_buffered(prompt, model_id, think_mode, file_refs, extra_fields, model_name, rid, bool(tools) and tool_choice != "none")
+            operation = lambda: self._generate_buffered(prompt, model_id, think_mode, file_refs, extra_fields, model_name, rid, tools_enabled)
             text = self._wait_with_heartbeat(operation) if req.get("stream") else operation()
         except Exception as e:
-            error = str(e).replace("\n", " ")[:500]
+            error = safe_error_message(e, 500)
+            status_code = 503 if isinstance(e, BlockingIOError) else 504 if isinstance(e, TimeoutError) else 502
             log(
                 f"request_finish id={rid} endpoint=responses status=error "
-                f"duration_ms={int((time.monotonic() - started_at) * 1000)} error={error}"
+                f"duration_ms={int((time.monotonic() - started_at) * 1000)} "
+                f"http_status={status_code} error_type={type(e).__name__} "
+                f"tools_enabled={tools_enabled} error={error}"
             )
-            self.send_json({"error": {"message": f"upstream error: {e}", "request_id": rid,
-                                     "retryable": True}},
-                           503 if isinstance(e, BlockingIOError) else 504 if isinstance(e, TimeoutError) else 502)
+            self.send_json({"error": {"message": f"upstream error: {error}", "request_id": rid,
+                                     "retryable": True}}, status_code)
             return
 
         quality = _classify_response_quality(prompt, text, bool(tools) and tool_choice != "none")

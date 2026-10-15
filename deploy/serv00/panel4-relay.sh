@@ -21,9 +21,9 @@ if [ -f "$pidfile" ]; then
 fi
 
 umask 077
-nohup /usr/local/bin/socat -T 240 \
+nohup /usr/local/bin/socat -T 1200 \
     TCP-LISTEN:7375,bind=127.0.0.1,reuseaddr,fork,max-children=3 \
-    EXEC:'/usr/bin/ssh -T -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=20 -o ServerAliveCountMax=3 -i /home/meatroll/.ssh/id_ed25519_gemini_panel2_stream igsshan@s2.serv00.com',nofork \
+    EXEC:'/usr/bin/ssh -T -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=20 -o ServerAliveCountMax=15 -i /home/meatroll/.ssh/id_ed25519_gemini_panel2_stream igsshan@s2.serv00.com',nofork \
     >> "$logfile" 2>&1 < /dev/null &
 pid=$!
 printf '%s\n' "$pid" > "$pidfile"
