@@ -1,0 +1,37 @@
+#!/bin/sh
+# Install a prepared FreeBSD image release using only bundled wheels.
+set -eu
+root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+cd "$root"
+umask 077
+python3 - <<'PY'
+import hashlib, json, platform, sys
+from pathlib import Path
+if platform.system() != "FreeBSD" or platform.machine() != "amd64" or sys.version_info[:2] != (3, 11):
+    raise SystemExit("This release requires FreeBSD amd64 and Python 3.11")
+checks = json.loads(Path("wheelhouse/SHA256SUMS.json").read_text())
+for name, expected in checks.items():
+    if Path(name).name != name:
+        raise SystemExit("Invalid wheel manifest path")
+    actual = hashlib.sha256((Path("wheelhouse") / name).read_bytes()).hexdigest()
+    if actual != expected:
+        raise SystemExit("Wheel checksum mismatch: " + name)
+print("Bundled FreeBSD wheels verified")
+PY
+if [ ! -x .venv/bin/python ]; then
+    python3 -m venv .venv
+fi
+.venv/bin/python -m pip install --no-index --find-links "$root/wheelhouse" \
+    -r requirements.txt curl_cffi==0.16.3
+.venv/bin/python - <<'PY'
+from curl_cffi import Curl
+from curl_cffi.requests.impersonate import DEFAULT_CHROME
+curl = Curl()
+try:
+    if curl.impersonate(DEFAULT_CHROME) != 0:
+        raise SystemExit("Chrome impersonation unavailable")
+    print(curl.version().decode())
+finally:
+    curl.close()
+PY
+printf 'Installed offline. Configure config.json, then run: sh start.sh\n'

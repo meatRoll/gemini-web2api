@@ -434,7 +434,7 @@ resp = client.chat.completions.create(
 
 ## Limitations
 
-- **Image input requires authentication and Chrome transport**: Use the modular server with a valid cookie and `curl_cffi`. This image transport is not available on Serv00/FreeBSD; text serving remains available.
+- **Image input requires authentication and Chrome transport**: Use the modular server with a valid cookie and `curl_cffi`. Serv00/FreeBSD can use the [native image-input release](deploy/serv00/README.md) with bundled runtime wheels, without Docker.
 - **Not real Pro/Ultra**: Without a paid subscription cookie, `gemini-3.1-pro` routes to the same Flash model. The "Pro" label is a UI preference, not a backend model switch.
 - **Single-turn only**: Each request is an independent conversation. Multi-turn context is simulated by including previous messages in the prompt.
 - **Rate limits**: Google may throttle high-frequency requests. The server retries automatically but sustained heavy use may be blocked.
