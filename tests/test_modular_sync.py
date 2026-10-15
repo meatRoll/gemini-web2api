@@ -627,10 +627,14 @@ class StreamingEndpointTests(unittest.TestCase):
         ]
         delta = chunks[0]["choices"][0]["delta"]
         self.assertEqual(delta["role"], "assistant")
+        self.assertNotIn("tool_calls", delta)
+        self.assertIsNone(chunks[0]["choices"][0]["finish_reason"])
+        final = next(chunk for chunk in chunks if chunk["choices"][0]["finish_reason"] == "tool_calls")
+        delta = final["choices"][0]["delta"]
         self.assertIsNone(delta["content"])
         self.assertEqual(delta["tool_calls"][0]["index"], 0)
         self.assertEqual(delta["tool_calls"][0]["function"]["name"], "read")
-        self.assertEqual(chunks[0]["choices"][0]["finish_reason"], "tool_calls")
+        self.assertEqual(final["choices"][0]["finish_reason"], "tool_calls")
         self.assertTrue(body.endswith("data: [DONE]\n\n"))
 
     @mock.patch("gemini_web2api.server.generate")
@@ -650,7 +654,12 @@ class StreamingEndpointTests(unittest.TestCase):
                 "tools": tools, "stream": True,
             })
             self.assertEqual(status, 200)
-            chunk = json.loads(body.splitlines()[0][len("data: "):])
+            chunk = next(
+                json.loads(line[len("data: "):])
+                for line in body.splitlines()
+                if line.startswith("data: {")
+                and json.loads(line[len("data: "):])["choices"][0]["finish_reason"] == "tool_calls"
+            )
             choice = chunk["choices"][0]
             self.assertEqual(choice["finish_reason"], "tool_calls")
             call = dict(choice["delta"]["tool_calls"][0])

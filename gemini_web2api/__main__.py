@@ -4,7 +4,7 @@ import os
 
 from .config import CONFIG, load_config, load_env, find_config
 from .models import get_models
-from .gemini import HAS_HTTPX
+from .gemini import HAS_HTTPX, log
 from .rotation import start_cookie_rotation
 from .model_monitor import start_model_monitor, stop_model_monitor
 from .server import GeminiHandler, ThreadedServer
@@ -40,6 +40,15 @@ def main():
     server = ThreadedServer((CONFIG["host"], port), GeminiHandler)
     start_cookie_rotation()
     start_model_monitor()
+    log(
+        f"service_start version={__version__} host={CONFIG['host']} port={port} "
+        f"request_timeout_sec={CONFIG['request_timeout_sec']} "
+        f"agent_request_budget_sec={CONFIG['agent_request_budget_sec']} "
+        f"retry_attempts={CONFIG['retry_attempts']} "
+        f"stream_heartbeat_sec={CONFIG.get('stream_heartbeat_sec', 'none')} "
+        f"models={','.join(get_models().keys())}",
+        force=True,
+    )
     print(f"gemini-web2api v{__version__}")
     if env_file:
         print(f"  Env file:  {env_file}")
