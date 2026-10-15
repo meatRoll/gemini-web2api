@@ -4,8 +4,9 @@
 [上游 PR #80](https://github.com/Sophomoresty/gemini-web2api/pull/80)，保留本 fork 的动态模型选择、
 请求预算和 SSE 心跳。图片输入的 SSE 内容在识别完成后一次返回。
 
-需要支持 Docker Compose 的 Linux 服务器。Serv00 的 FreeBSD 主机无法运行此 Linux 镜像，
-`curl_cffi` 也没有随此项目提供 FreeBSD 运行库。原来的文本服务无需替换。
+本目录的 Compose 配置需要支持 Docker 的 Linux 服务器。Serv00/FreeBSD 请使用
+[原生图片部署包](../serv00/README.md)，其中包含已编译的 `curl_cffi`、Chrome 传输库和离线依赖，
+不需要 Docker。本目录的 `smoke.py` 同样适用于 FreeBSD。
 
 测试镜像通过当前分支的 Docker workflow 手动构建；分支镜像标签为
 `ghcr.io/meatroll/gemini-web2api:feat-multimodal-image-input`，同时提供 `sha-<7位提交号>` 标签。
