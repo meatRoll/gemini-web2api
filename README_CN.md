@@ -393,7 +393,7 @@ resp = client.chat.completions.create(
 
 ## 已知限制
 
-- **图片输入需要登录和 Chrome 传输**: 请使用模块版服务、有效 Cookie 和 `curl_cffi`。Serv00/FreeBSD 暂不支持此图片传输；文本服务仍可使用。
+- **图片输入需要登录和 Chrome 传输**: 请使用模块版服务、有效 Cookie 和 `curl_cffi`。Serv00/FreeBSD 可使用附带原生运行库的[图片部署包](deploy/serv00/README.md)，无需 Docker。
 - **Pro/Ultra 非真实路由**: 无付费订阅 cookie 时, `gemini-3.1-pro` 实际路由到 Flash 模型. "Pro" 只是 UI 偏好标签.
 - **单轮对话**: 每次请求是独立对话, 多轮上下文通过在 prompt 中包含历史消息模拟.
 - **频率限制**: Google 可能限制高频请求, server 会自动重试但持续高负载可能被封.
