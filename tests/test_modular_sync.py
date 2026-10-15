@@ -208,6 +208,70 @@ class AuthSyncTests(unittest.TestCase):
                                 cancelled=mock.Mock(side_effect=[False, True]))
         self.assertTrue(response.closed)
 
+    def test_buffered_first_response_precedes_completion(self):
+        for budget in (None, 45):
+            with self.subTest(budget=budget):
+                order = []
+                chunks = iter([b"metadata without text", b"more", b""])
+                response = mock.Mock()
+
+                def read_chunk(_size):
+                    order.append("read")
+                    return next(chunks)
+
+                response.read1.side_effect = read_chunk
+                with mock.patch.object(gemini.urllib.request, "urlopen", return_value=response), \
+                     mock.patch.object(gemini, "extract_response_text", side_effect=lambda _: order.append("parse") or "ok"):
+                    result = gemini.generate(
+                        "hello", 1, 4, budget_sec=budget,
+                        on_first_response=lambda: order.append("first_data"),
+                    )
+                self.assertEqual(result, "ok")
+                self.assertEqual(order, ["read", "first_data", "read", "read", "parse"])
+                response.close.assert_called_once()
+
+    def test_buffered_first_response_requires_successful_body_data(self):
+        callback = mock.Mock()
+        with mock.patch.object(gemini.urllib.request, "urlopen", return_value=io.BytesIO(b"")):
+            gemini.generate("hello", 1, 4, on_first_response=callback)
+        callback.assert_not_called()
+        error = gemini.urllib.error.HTTPError("https://example.invalid", 401, "unauthorized", {}, None)
+        with mock.patch.object(gemini.urllib.request, "urlopen", side_effect=error):
+            with self.assertRaises(gemini.urllib.error.HTTPError):
+                gemini.generate("hello", 1, 4, on_first_response=callback)
+        callback.assert_not_called()
+
+    def test_stream_first_response_does_not_wait_for_text_or_newline(self):
+        callback = mock.Mock()
+        client = mock.MagicMock()
+        response = client.stream.return_value.__enter__.return_value
+
+        def chunks():
+            callback.assert_not_called()
+            yield ""
+            callback.assert_not_called()
+            yield ")]}'"
+            callback.assert_called_once_with()
+            yield "\nmetadata\n"
+
+        response.iter_text.side_effect = chunks
+        with mock.patch.object(gemini, "HAS_HTTPX", True), \
+             mock.patch.object(gemini, "_get_httpx_client", return_value=client):
+            self.assertEqual(list(gemini.generate_stream("hello", 1, 4, on_first_response=callback)), [])
+        callback.assert_called_once_with()
+
+    def test_stream_http_error_does_not_signal_first_response(self):
+        callback = mock.Mock()
+        client = mock.MagicMock()
+        response = client.stream.return_value.__enter__.return_value
+        response.raise_for_status.side_effect = RuntimeError("upstream HTTP error")
+        with mock.patch.object(gemini, "HAS_HTTPX", True), \
+             mock.patch.object(gemini, "_get_httpx_client", return_value=client):
+            with self.assertRaisesRegex(RuntimeError, "upstream HTTP error"):
+                list(gemini.generate_stream("hello", 1, 4, on_first_response=callback))
+        callback.assert_not_called()
+        response.iter_text.assert_not_called()
+
     def test_stream_does_not_retry_after_emitting_output(self):
         client = mock.MagicMock()
         response = client.stream.return_value.__enter__.return_value
@@ -590,6 +654,82 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(chunks[0]["choices"][0]["delta"], {"role": "assistant"})
         self.assertEqual(chunks[1]["choices"][0]["delta"], {"content": "hel"})
         self.assertEqual(chunks[2]["choices"][0]["delta"], {"content": "lo"})
+        self.assertTrue(body.endswith("data: [DONE]\n\n"))
+
+    def test_chat_acknowledges_upstream_data_before_content(self):
+        CONFIG["stream_heartbeat_sec"] = 0.01
+        for tools_enabled in (False, True):
+            with self.subTest(tools=tools_enabled):
+                upstream_ready = threading.Event()
+                finish = threading.Event()
+
+                def acknowledge(kwargs):
+                    if not upstream_ready.wait(5):
+                        raise TimeoutError("test did not release upstream")
+                    kwargs["on_first_response"]()
+                    if not finish.wait(5):
+                        raise TimeoutError("test did not release content")
+
+                def buffered(*_args, **kwargs):
+                    acknowledge(kwargs)
+                    return '```client_operation\n{"name":"read","arguments":{}}\n```'
+
+                def streaming(*_args, **kwargs):
+                    acknowledge(kwargs)
+                    yield "hello"
+
+                def read_event(response):
+                    lines = []
+                    while True:
+                        line = response.readline().decode()
+                        if line == "\n" or not line:
+                            return "".join(lines)
+                        lines.append(line)
+
+                connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+                target = "generate" if tools_enabled else "generate_stream"
+                with mock.patch("gemini_web2api.server." + target, side_effect=buffered if tools_enabled else streaming):
+                    payload = {"messages": [{"role": "user", "content": "hello"}], "stream": True}
+                    if tools_enabled:
+                        payload["tools"] = [{"type": "function", "function": {"name": "read"}}]
+                    try:
+                        connection.request("POST", "/v1/chat/completions", json.dumps(payload), {"Content-Type": "application/json"})
+                        response = connection.getresponse()
+                        self.assertEqual(read_event(response), ": keep-alive\n")
+                        # A heartbeat before upstream data must also remain a comment.
+                        self.assertEqual(read_event(response), ": keep-alive\n")
+                        upstream_ready.set()
+                        while True:
+                            event = read_event(response)
+                            if event.startswith("data: "):
+                                break
+                        chunk = json.loads(event[len("data: "):])
+                        self.assertEqual(chunk["choices"][0]["delta"], {"role": "assistant"})
+                        self.assertIsNone(chunk["choices"][0]["finish_reason"])
+                        # The request is still generating, but post-ack heartbeats use data.
+                        heartbeat = json.loads(read_event(response)[len("data: "):])
+                        self.assertEqual(heartbeat["choices"][0]["delta"], {})
+                        self.assertFalse(finish.is_set())
+                        finish.set()
+                        remainder = response.read().decode()
+                        self.assertIn('"tool_calls"' if tools_enabled else '"hello"', remainder)
+                        self.assertTrue(remainder.endswith("data: [DONE]\n\n"))
+                    finally:
+                        upstream_ready.set()
+                        finish.set()
+                        connection.close()
+
+    @mock.patch("gemini_web2api.server.generate", side_effect=TimeoutError("no upstream body"))
+    def test_chat_stream_error_before_upstream_data_has_no_role_ack(self, _generate):
+        status, _, body = self.post_json("/v1/chat/completions", {
+            "messages": [{"role": "user", "content": "read"}], "stream": True,
+            "tools": [{"type": "function", "function": {"name": "read"}}],
+        })
+        self.assertEqual(status, 200)
+        chunks = [json.loads(line[6:]) for line in body.splitlines() if line.startswith("data: {")]
+        self.assertEqual(len(chunks), 1)
+        self.assertIn("error", chunks[0])
+        self.assertNotIn('"role": "assistant"', body)
         self.assertTrue(body.endswith("data: [DONE]\n\n"))
 
     @mock.patch("gemini_web2api.server.parse_tool_calls")
