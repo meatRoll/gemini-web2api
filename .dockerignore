@@ -7,3 +7,12 @@ config.json
 cookie.txt
 cookie.json
 .env
+.env.*
+*auth*.json
+*cookie*.json
+*cookie*.txt
+gemini-models*.json
+*.sqlite3
+*.sqlite3-*
+logs
+.pytest_cache
