@@ -9,6 +9,14 @@ import hashlib, json, platform, sys
 from pathlib import Path
 if platform.system() != "FreeBSD" or platform.machine() != "amd64" or sys.version_info[:2] != (3, 11):
     raise SystemExit("This release requires FreeBSD amd64 and Python 3.11")
+files = json.loads(Path("SHA256SUMS.json").read_text())
+for name, expected in files.items():
+    relative = Path(name)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise SystemExit("Invalid release manifest path")
+    if hashlib.sha256(relative.read_bytes()).hexdigest() != expected:
+        raise SystemExit("Release checksum mismatch: " + name)
+print("Release files verified")
 checks = json.loads(Path("wheelhouse/SHA256SUMS.json").read_text())
 for name, expected in checks.items():
     if Path(name).name != name:

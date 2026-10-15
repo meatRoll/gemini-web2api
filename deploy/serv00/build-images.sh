@@ -20,8 +20,11 @@ cp "$wheels/runtime-manifest.json" "$release/wheelhouse/"
 cp "$root/deploy/serv00/install-image.sh" "$release/install.sh"
 cp "$root/deploy/image-test/smoke.py" "$release/smoke.py"
 cp "$root/deploy/serv00/build-image-runtime.py" "$release/build-image-runtime.py"
+cp "$root/deploy/serv00/config.production.example.json" "$release/config.example.json"
+cp "$root/deploy/serv00/RELEASE_NOTES.md" "$release/RELEASE_NOTES.md"
+cp "$root/LICENSE" "$release/LICENSE"
 python3 - "$root" "$release" <<'PY'
-import hashlib, json, subprocess, sys
+import hashlib, json, runpy, subprocess, sys
 from pathlib import Path
 root, release = map(Path, sys.argv[1:])
 wheelhouse = release / "wheelhouse"
@@ -34,8 +37,13 @@ config.update(host="127.0.0.1", port=41748, cookie_file="cookie.json", model_sna
               cache_db_path="./image-test-cache.sqlite3", log_file="logs/service.log")
 (release / "config.image-test.example.json").write_text(json.dumps(config, indent=2) + "\n")
 revision = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
-(release / "release.json").write_text(json.dumps({"revision": revision, "platform": "FreeBSD amd64",
-    "python": "3.11", "image_input": True, "default_image_test_port": 41748}, indent=2) + "\n")
+version = runpy.run_path(str(root / "gemini_web2api/__init__.py"))["__version__"]
+(release / "release.json").write_text(json.dumps({"version": version, "channel": "stable",
+    "revision": revision, "platform": "FreeBSD 14.3 amd64", "python": "3.11",
+    "image_input": True, "offline_install": True, "default_image_test_port": 41748}, indent=2) + "\n")
+files = {p.relative_to(release).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+         for p in sorted(release.rglob("*")) if p.is_file()}
+(release / "SHA256SUMS.json").write_text(json.dumps(files, indent=2) + "\n")
 PY
 tar -czf "$out" -C "$stage" gemini-web2api
 printf 'Created FreeBSD image-input release: %s\n' "$out"
