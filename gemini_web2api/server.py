@@ -14,7 +14,7 @@ from socketserver import ThreadingMixIn
 
 from .config import CONFIG
 from .models import get_models, resolve_model
-from .gemini import generate, generate_stream, log, _session_hash, safe_error_message
+from .gemini import GeminiUpstreamError, generate, generate_stream, log, _session_hash, safe_error_message
 from .tools import has_tool_call_marker, valid_tool_call_candidate, validate_tool_calls
 from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
 from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
@@ -126,17 +126,19 @@ def _upload_images(images: list) -> list:
         if not (isinstance(item, tuple) and len(item) == 2):
             continue
         data, mime = item
-        if isinstance(data, str):
-            data = fetch_image_bytes(data)
-            mime = mime or "image/png"
-        if not data:
-            raise RuntimeError("image fetch failed")
-        mime = detect_image_mime(data, mime or "image/png")
         try:
-            ref = upload_image(data, "image.png", mime or "image/png")
-            file_refs.append(ref)
+            if isinstance(data, str):
+                data = fetch_image_bytes(data)
+            if not data:
+                raise RuntimeError("image data is empty")
+            if len(data) > 10 * 1024 * 1024:
+                raise RuntimeError("image exceeds 10 MiB size limit")
+            mime = detect_image_mime(data, mime or "image/png")
+            filename = "image.png"
+            ref = upload_image(data, filename, mime)
+            file_refs.append((ref, filename))
         except Exception as e:
-            raise RuntimeError(f"image upload failed: {e}") from e
+            raise RuntimeError(f"image upload failed: {safe_error_message(e)}") from e
     return file_refs if file_refs else None
 
 
@@ -613,7 +615,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                         "type": "upstream_stream_error",
                         "message": "upstream stream interrupted",
                         "request_id": cid,
-                        "retryable": not bool(stream_text),
+                        "retryable": not bool(stream_text) and not isinstance(e, GeminiUpstreamError),
                     }}
                     self.wfile.write(f"data: {json.dumps(error_event)}\n\n".encode())
                     self.wfile.write(b"data: [DONE]\n\n")
@@ -648,7 +650,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 f"tools_enabled={tools_enabled} error={error}"
             )
             self.send_json({"error": {"message": f"upstream error: {error}", "request_id": cid,
-                                     "retryable": True}},
+                                     "retryable": not isinstance(e, GeminiUpstreamError)}},
                            status_code)
             return
 
@@ -849,7 +851,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 f"tools_enabled={tools_enabled} error={error}"
             )
             self.send_json({"error": {"message": f"upstream error: {error}", "request_id": rid,
-                                     "retryable": True}}, status_code)
+                                     "retryable": not isinstance(e, GeminiUpstreamError)}}, status_code)
             return
 
         quality = _classify_response_quality(prompt, text, bool(tools) and tool_choice != "none")

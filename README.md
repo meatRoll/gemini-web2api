@@ -403,8 +403,21 @@ resp = client.chat.completions.create(
 
 ## Image Input
 
-OpenAI-style multimodal messages are supported for Chat Completions and the
-Responses API. Use either HTTP(S) image URLs or base64 data URLs:
+The modular server (`python -m gemini_web2api`, including Docker images) supports
+image input through Chat Completions, Responses, and Google `inlineData`. It requires
+a valid authenticated Gemini cookie and `curl_cffi` (installed by `requirements.txt`
+on supported platforms). Supply public HTTPS image URLs or base64 data URLs, with a
+10 MiB limit per image. The legacy single-file entry point and Cloudflare Worker
+have not received this transport fix.
+
+The attachment format, fresh page session tokens, and Chrome transport are adapted
+from [upstream PR #80](https://github.com/Sophomoresty/gemini-web2api/pull/80).
+Image requests with `stream=true` return one complete content chunk; SSE heartbeats
+remain active while waiting. Remote image downloads use direct connections with
+validated DNS addresses pinned, bypassing proxies. Gemini page, upload, and generation
+requests still honor the configured proxy.
+
+See the [isolated image test deployment](deploy/image-test/README.md) for bounded validation.
 
 ```python
 resp = client.chat.completions.create(
@@ -421,7 +434,7 @@ resp = client.chat.completions.create(
 
 ## Limitations
 
-- **Image upload may require cookies**: Multimodal input uses Gemini Web's image upload endpoint. If anonymous upload fails, configure a Gemini cookie.
+- **Image input requires authentication and Chrome transport**: Use the modular server with a valid cookie and `curl_cffi`. This image transport is not available on Serv00/FreeBSD; text serving remains available.
 - **Not real Pro/Ultra**: Without a paid subscription cookie, `gemini-3.1-pro` routes to the same Flash model. The "Pro" label is a UI preference, not a backend model switch.
 - **Single-turn only**: Each request is an independent conversation. Multi-turn context is simulated by including previous messages in the prompt.
 - **Rate limits**: Google may throttle high-frequency requests. The server retries automatically but sustained heavy use may be blocked.

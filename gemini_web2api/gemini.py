@@ -17,6 +17,13 @@ try:
 except ImportError:
     HAS_HTTPX = False
 
+try:
+    from curl_cffi import requests as curl_requests
+    HAS_CURL_CFFI = True
+except ImportError:
+    curl_requests = None
+    HAS_CURL_CFFI = False
+
 from .config import CONFIG
 from .tools import has_tool_call_marker, valid_tool_call_candidate
 
@@ -163,7 +170,7 @@ def _account_prefix() -> str:
     return f"/u/{auth_user}"
 
 
-def _build_headers(session_hash=None) -> dict:
+def _build_headers(session_hash=None, request_uuid=None) -> dict:
     cookie_str, sapisid = load_cookie()
     account_prefix = _account_prefix()
     headers = {
@@ -173,6 +180,8 @@ def _build_headers(session_hash=None) -> dict:
         "X-Same-Domain": "1",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     }
+    if request_uuid:
+        headers["x-goog-ext-525005358-jspb"] = json.dumps([request_uuid, 1])
     if account_prefix:
         headers["X-Goog-AuthUser"] = str(CONFIG["auth_user"])
     if cookie_str:
@@ -208,10 +217,26 @@ def _apply_chat_persistence_flags(inner: list) -> None:
         inner[41] = [2]
 
 
-def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
-    inner = [None] * 102
+def _normalise_file_ref(file_ref) -> list:
+    """Accept legacy references and preserve filenames in current attachments."""
+    if isinstance(file_ref, (tuple, list)) and len(file_ref) == 2:
+        ref, filename = file_ref
+    else:
+        ref, filename = file_ref, "image.png"
+    if not isinstance(ref, str) or not ref.startswith("/"):
+        raise ValueError("invalid uploaded file reference")
+    if not isinstance(filename, str) or not filename:
+        raise ValueError("invalid uploaded filename")
+    return [[ref], filename]
+
+
+def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list = None,
+                   extra_fields: dict = None, xsrf_token: str = None,
+                   request_uuid: str = None) -> str:
+    # Only file requests use the capture-derived 81-slot attachment protocol.
+    inner = [None] * (81 if file_refs else 102)
     if file_refs:
-        refs = [[None, None, ref] for ref in file_refs]
+        refs = [_normalise_file_ref(ref) for ref in file_refs]
         inner[0] = [prompt, 0, None, refs, None, None, 0]
     else:
         inner[0] = [prompt, 0, None, None, None, None, 0]
@@ -227,28 +252,35 @@ def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list 
     inner[30] = [4]
     _apply_chat_persistence_flags(inner)
     inner[53] = 0
-    inner[59] = str(uuid.uuid4())
+    inner[59] = request_uuid or str(uuid.uuid4())
     inner[61] = []
     inner[68] = 1
     inner[79] = model_id
+    if file_refs:
+        inner[80] = 1
     if extra_fields:
         for k, v in extra_fields.items():
             if k != "_model_selection":
+                if k >= len(inner):
+                    inner.extend([None] * (k + 1 - len(inner)))
                 inner[k] = v
     outer = [None, json.dumps(inner)]
     params = {"f.req": json.dumps(outer)}
-    if CONFIG.get("xsrf_token"):
-        params["at"] = CONFIG["xsrf_token"]
+    if xsrf_token or CONFIG.get("xsrf_token"):
+        params["at"] = xsrf_token or CONFIG["xsrf_token"]
     return urllib.parse.urlencode(params)
 
 
-def _get_url() -> str:
+def _get_url(session_id: str = None) -> str:
     reqid = int(time.time()) % 1000000
     account_prefix = _account_prefix()
+    params = {"bl": CONFIG["gemini_bl"], "hl": "en", "_reqid": reqid, "rt": "c"}
+    if session_id:
+        params["f.sid"] = session_id
     return (
         f"https://gemini.google.com{account_prefix}/_/BardChatUi/data/"
-        "assistant.lamda.BardFrontendService/StreamGenerate"
-        f"?bl={CONFIG['gemini_bl']}&hl=en&_reqid={reqid}&rt=c"
+        "assistant.lamda.BardFrontendService/StreamGenerate?"
+        f"{urllib.parse.urlencode(params)}"
     )
 
 
@@ -286,12 +318,9 @@ def _extract_texts_from_line(line: str) -> list:
 
 def _extract_stream_deltas(line: str, emitted_raw_text: str) -> tuple:
     """Return the new cumulative text and incremental deltas from one line."""
-    if "BardErrorInfo" in line:
-        bard_err = re.search(r'BardErrorInfo(?:"\s*,\s*\[|\s*\[)(\d+)\]', line)
-        if bard_err:
-            raise RuntimeError(
-                f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]"
-            )
+    code = _bard_error_code(line)
+    if code is not None:
+        raise GeminiUpstreamError(f"Gemini upstream rejected request: BardErrorInfo [{code}]")
 
     deltas = []
     for text in _extract_texts_from_line(line):
@@ -353,11 +382,55 @@ def _response_candidate_stats(raw: str):
     return len(candidates), sum(lengths), max(lengths, default=0), lengths[-12:], repeated_prefix
 
 
+class GeminiUpstreamError(RuntimeError):
+    """An application-level rejection that must not trigger generation retries."""
+
+
+def _bard_error_code(raw: str):
+    legacy = re.search(r'BardErrorInfo(?:"\s*,\s*\[|\s*\[)(\d+)\]', raw)
+    if legacy:
+        return int(legacy.group(1))
+    if "BardErrorInfo" not in raw:
+        return None
+
+    def find(value):
+        if isinstance(value, list):
+            for index, item in enumerate(value):
+                if (isinstance(item, str) and item.endswith(".BardErrorInfo")
+                        and index + 1 < len(value)):
+                    details = value[index + 1]
+                    if isinstance(details, list) and details and isinstance(details[0], int):
+                        return details[0]
+                code = find(item)
+                if code is not None:
+                    return code
+        elif isinstance(value, dict):
+            for item in value.values():
+                code = find(item)
+                if code is not None:
+                    return code
+        elif isinstance(value, str) and value[:1] in ("[", "{"):
+            try:
+                return find(json.loads(value))
+            except json.JSONDecodeError:
+                pass
+        return None
+
+    for line in raw.splitlines():
+        try:
+            code = find(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+        if code is not None:
+            return code
+    return None
+
+
 def extract_response_text(raw: str) -> str:
     """Parse full response to get final text."""
-    bard_err = re.search(r'BardErrorInfo(?:"\s*,\s*\[|\s*\[)(\d+)\]', raw)
-    if bard_err:
-        raise RuntimeError(f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]")
+    code = _bard_error_code(raw)
+    if code is not None:
+        raise GeminiUpstreamError(f"Gemini upstream rejected request: BardErrorInfo [{code}]")
     # ponytail: regex probe — backend echoes actual model name (e.g. "3.5 Flash-Lite");
     # may miss if backend renames formats, check raw response then.
     m = re.search(r'"(\d\.\d (?:Flash(?:-Lite)?|Thinking|Pro))', raw)
@@ -369,8 +442,103 @@ def extract_response_text(raw: str) -> str:
 
 
 
+def _generate_file_with_curl(prompt, model_id, think_mode, file_refs, extra_fields=None,
+                             session_hash=None, request_id=None, *, budget_sec=None,
+                             max_attempts=None, cancelled=None, on_first_response=None):
+    """Port PR #80's Chrome attachment transport with request budgets and routing."""
+    if not HAS_CURL_CFFI:
+        raise RuntimeError("curl_cffi is required for Gemini image input")
+    started = time.monotonic()
+    deadline = started + budget_sec if budget_sec is not None else None
+    configured_timeout = max(0.001, float(CONFIG["request_timeout_sec"]))
+
+    def remaining_timeout():
+        if cancelled and cancelled():
+            raise ConnectionAbortedError("Client disconnected during image generation")
+        remaining = configured_timeout if deadline is None else min(
+            configured_timeout, deadline - time.monotonic()
+        )
+        if remaining <= 0:
+            raise TimeoutError("Generation budget exhausted")
+        return remaining
+
+    cookie, _ = load_cookie()
+    if not cookie:
+        raise RuntimeError("A valid Gemini cookie is required for image input")
+    request_uuid = str(uuid.uuid4()).upper()
+    selection = (extra_fields or {}).get("_model_selection")
+    headers = _build_headers(
+        selection if selection is not None else session_hash, request_uuid=request_uuid
+    )
+    # Import lazily: multimodal uses the cookie and logging helpers above.
+    from .multimodal import _cached_page_tokens
+    tokens = _cached_page_tokens(max_age=0, timeout=remaining_timeout())
+    if not tokens.get("at") or not tokens.get("f_sid"):
+        raise RuntimeError("Gemini image session is unavailable; refresh the authentication export")
+    body = _build_payload(
+        prompt, model_id, think_mode, file_refs, extra_fields,
+        xsrf_token=tokens["at"], request_uuid=request_uuid,
+    )
+    url = _get_url(tokens["f_sid"])
+    trace_id = request_id or uuid.uuid4().hex[:10]
+    attempts = max(1, max_attempts if max_attempts is not None else CONFIG["retry_attempts"])
+    log(f"upstream_start transport=chrome_file id={trace_id} images={len(file_refs)} "
+        f"max_attempts={attempts} {_selection_log_fields(selection)}")
+    notified = False
+    for attempt in range(attempts):
+        response = None
+        session = None
+        try:
+            timeout = remaining_timeout()
+            session = curl_requests.Session()
+            args = {"data": body, "headers": headers, "timeout": timeout,
+                    "impersonate": "chrome", "stream": True, "allow_redirects": False}
+            if CONFIG.get("proxy"):
+                args["proxy"] = CONFIG["proxy"]
+            response = session.post(url, **args)
+            if response.status_code in (401, 403, 429):
+                raise GeminiUpstreamError(f"Gemini image request rejected: HTTP {response.status_code}")
+            response.raise_for_status()
+            if response.status_code != 200:
+                raise GeminiUpstreamError(f"Unexpected Gemini image response: HTTP {response.status_code}")
+            parts = []
+            for chunk in response.iter_content(chunk_size=65536):
+                remaining_timeout()
+                if not chunk:
+                    continue
+                if not notified and on_first_response is not None:
+                    notified = True
+                    on_first_response()
+                parts.append(chunk)
+            text = extract_response_text(b"".join(parts).decode("utf-8", errors="replace"))
+            log(f"upstream_finish transport=chrome_file id={trace_id} attempt={attempt + 1} "
+                f"duration_ms={int((time.monotonic() - started) * 1000)} extracted_chars={len(text)}")
+            return text
+        except Exception as error:
+            log(f"upstream_error transport=chrome_file id={trace_id} attempt={attempt + 1} "
+                f"error_type={type(error).__name__} error={safe_error_message(error)}")
+            if (isinstance(error, (GeminiUpstreamError, TimeoutError, ConnectionAbortedError))
+                    or getattr(error, "code", None) == 28 or attempt + 1 >= attempts):
+                raise
+            delay = _retry_delay(attempt)
+            if deadline is not None and time.monotonic() + delay >= deadline:
+                raise TimeoutError("Generation budget exhausted") from error
+        finally:
+            if response is not None:
+                response.close()
+            if session is not None:
+                session.close()
+        time.sleep(delay)
+
+
 def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None, session_hash: str = None, request_id: str = None, *, budget_sec: float = None, max_attempts: int = None, cancelled=None, on_first_response=None) -> str:
     """Non-streaming generation with retry."""
+    if file_refs:
+        return _generate_file_with_curl(
+            prompt, model_id, think_mode, file_refs, extra_fields, session_hash,
+            request_id, budget_sec=budget_sec, max_attempts=max_attempts,
+            cancelled=cancelled, on_first_response=on_first_response,
+        )
     load_cookie()
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
     url = _get_url()
@@ -488,7 +656,7 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
                 f"budget_remaining_sec={remaining_label} error_type={type(e).__name__} "
                 f"timeout_reason={timeout_reason} error={safe_error_message(e)}"
             )
-            if isinstance(e, (TimeoutError, ConnectionAbortedError)):
+            if isinstance(e, (TimeoutError, ConnectionAbortedError, GeminiUpstreamError)):
                 raise
             if attempt < attempts - 1:
                 delay = _retry_delay(attempt)
@@ -504,8 +672,8 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
 
 
 def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None, session_hash: str = None, request_id: str = None, *, on_first_response=None):
-    """Streaming generation via httpx with retry on connection failure."""
-    if not HAS_HTTPX:
+    """Stream text; attachment requests return one complete Chrome-backed result."""
+    if file_refs or not HAS_HTTPX:
         kwargs = {"on_first_response": on_first_response} if on_first_response is not None else {}
         text = generate(prompt, model_id, think_mode, file_refs, extra_fields, session_hash, request_id=request_id, **kwargs)
         if text:
@@ -588,7 +756,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
             # Once bytes have been delivered, restarting would duplicate or
             # replace already visible model output. Let the API layer report a
             # terminal stream error instead.
-            if emitted_raw_text:
+            if emitted_raw_text or isinstance(e, GeminiUpstreamError):
                 raise
             if attempt < max(1, CONFIG["retry_attempts"]) - 1:
                 delay = _retry_delay(attempt)

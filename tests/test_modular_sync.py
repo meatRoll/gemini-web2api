@@ -326,7 +326,9 @@ class PayloadPersistenceTests(unittest.TestCase):
         inner = _decode_payload(_build_payload("describe", 1, 4, ["/uploaded/image-ref"]))
 
         self.assertEqual(inner[0][0], "describe")
-        self.assertEqual(inner[0][3], [[None, None, "/uploaded/image-ref"]])
+        self.assertEqual(inner[0][3], [[["/uploaded/image-ref"], "image.png"]])
+        self.assertEqual(len(inner), 81)
+        self.assertEqual(inner[80], 1)
 
 
 class ContextCacheTests(unittest.TestCase):
@@ -896,7 +898,7 @@ class StreamingEndpointTests(unittest.TestCase):
 
         self.assertEqual(status, 200)
         upload_image.assert_called_once_with(b"fake png", "image.png", "image/png")
-        self.assertEqual(generate.call_args.args[3], ["/uploaded/image-ref"])
+        self.assertEqual(generate.call_args.args[3], [("/uploaded/image-ref", "image.png")])
         self.assertIn("[Image attached]", generate.call_args.args[0])
         self.assertEqual(json.loads(body)["choices"][0]["message"]["content"], "looks good")
 
@@ -924,7 +926,7 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(status, 200)
         fetch_image_bytes.assert_called_once_with("https://example.com/image.jpg")
         upload_image.assert_called_once_with(b"\xff\xd8\xffremote jpeg", "image.png", "image/jpeg")
-        self.assertEqual(generate.call_args.args[3], ["/uploaded/remote-ref"])
+        self.assertEqual(generate.call_args.args[3], [("/uploaded/remote-ref", "image.png")])
         self.assertIn("[Image attached]", generate.call_args.args[0])
 
     @mock.patch("gemini_web2api.server.upload_image", return_value="/uploaded/image-ref")
@@ -948,7 +950,7 @@ class StreamingEndpointTests(unittest.TestCase):
 
         self.assertEqual(status, 200)
         upload_image.assert_called_once_with(b"fake png", "image.png", "image/png")
-        self.assertEqual(generate.call_args.args[3], ["/uploaded/image-ref"])
+        self.assertEqual(generate.call_args.args[3], [("/uploaded/image-ref", "image.png")])
         self.assertIn("What is shown?", generate.call_args.args[0])
         self.assertIn("[Image attached]", generate.call_args.args[0])
 

@@ -366,8 +366,17 @@ python gemini_web2api.py
 
 ## 图片输入
 
-Chat Completions 和 Responses API 支持 OpenAI 风格的多模态消息。图片可以使用
-HTTP(S) URL 或 base64 data URL:
+模块版服务（`python -m gemini_web2api`，包括 Docker 镜像）的 Chat Completions、Responses API
+和 Google `inlineData` 支持图片输入。需要有效的 Gemini 登录 Cookie 和 `curl_cffi`
+（安装 `requirements.txt` 时会在受支持的平台上安装）。可使用公网 HTTPS 图片 URL
+或 base64 data URL；每张图片最多 10 MiB。旧单文件入口和 Cloudflare Worker 尚未移植此修复。
+
+图片请求采用与 [上游 PR #80](https://github.com/Sophomoresty/gemini-web2api/pull/80)
+相同的附件结构、页面会话 token 和 Chrome 传输方式。`stream=true` 时返回一个完整内容块，
+等待生成期间仍保留 SSE 心跳。远程图片下载为固定已校验的 DNS 地址而直连，
+不会使用代理；Gemini 页面、上传和生成请求仍使用配置的代理。
+
+隔离部署和限次验收见 [图片测试部署说明](deploy/image-test/README.md)。
 
 ```python
 resp = client.chat.completions.create(
@@ -384,7 +393,7 @@ resp = client.chat.completions.create(
 
 ## 已知限制
 
-- **图片上传可能需要 Cookie**: 多模态输入使用 Gemini 网页端图片上传接口。匿名上传失败时, 请配置 Gemini cookie。
+- **图片输入需要登录和 Chrome 传输**: 请使用模块版服务、有效 Cookie 和 `curl_cffi`。Serv00/FreeBSD 暂不支持此图片传输；文本服务仍可使用。
 - **Pro/Ultra 非真实路由**: 无付费订阅 cookie 时, `gemini-3.1-pro` 实际路由到 Flash 模型. "Pro" 只是 UI 偏好标签.
 - **单轮对话**: 每次请求是独立对话, 多轮上下文通过在 prompt 中包含历史消息模拟.
 - **频率限制**: Google 可能限制高频请求, server 会自动重试但持续高负载可能被封.
