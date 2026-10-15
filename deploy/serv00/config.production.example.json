@@ -1,0 +1,19 @@
+{
+  "host": "127.0.0.1",
+  "port": 8081,
+  "cookie_file": "cookie.json",
+  "model_snapshot_file": "./gemini-models.json",
+  "client_allowlist_file": null,
+  "api_keys": [],
+  "request_timeout_sec": 840,
+  "agent_request_budget_sec": 720,
+  "stream_heartbeat_sec": 10,
+  "retry_attempts": 1,
+  "model_check_interval_sec": 86400,
+  "cookie_rotation_interval_sec": 300,
+  "temporary_chats": true,
+  "auto_cache": false,
+  "cache_db_path": "./gemini-web2api-cache.sqlite3",
+  "log_file": "./logs/service.log",
+  "log_requests": true
+}

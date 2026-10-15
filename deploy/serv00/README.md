@@ -3,9 +3,26 @@
 There are two native FreeBSD release archives. Neither requires Docker or root access, and neither includes cookies, credentials, or private configuration.
 
 - `gemini-web2api-serv00.tar.gz`: application source for text serving; install dependencies from PyPI.
-- `gemini-web2api-serv00-images.tar.gz`: application source plus a complete offline wheelhouse for **FreeBSD 14.3 amd64 / Python 3.11**, including Chrome image transport. Use this release for image input.
+- `gemini-web2api-serv00-images.tar.gz`: application source plus a complete offline wheelhouse for **FreeBSD 14.3 amd64 / Python 3.11**, including Chrome image transport. Use this release for image input. Stable releases can be named `gemini-web2api-serv00-v1.1.1-freebsd14.3-amd64-py311.tar.gz`.
 
-The image release bundles `curl_cffi 0.16.3` statically linked with upstream `libcurl-impersonate 2.2.2` (BoringSSL). Its build applies only FreeBSD architecture detection and libc++ link flags from upstream. `build-image-runtime.py` pins and verifies both source archives, and records the runtime source and wheel hashes. The installer checks all wheel hashes before installing. No library compilation is required when deploying the prepared release.
+The stable 1.1.1 release includes a production `config.example.json`, a separate test template, [release notes](RELEASE_NOTES.md), and file/dependency SHA256 manifests. The health endpoint and `python -m gemini_web2api --version` report the application version; `release.json` records the exact source commit and stable channel. Deploy it to the directory and port used by your existing tunnel/client so they reach the upgraded service.
+
+For a new production installation:
+
+```sh
+mkdir -p ~/gemini-web2api
+tar -xzf gemini-web2api-serv00-v1.1.1-freebsd14.3-amd64-py311.tar.gz -C ~/gemini-web2api --strip-components 1
+cd ~/gemini-web2api
+sh install.sh
+cp config.example.json config.json
+# Reserve a TCP port with `devil port add tcp random`, then configure that port.
+# Configure api_keys and cookie_file before starting, and connect your tunnel to this port.
+sh start.sh
+```
+
+For upgrades, retain the existing `config.json`, credentials, model snapshot and cache. Install dependencies in a fresh venv, save the previous code and venv, and stop/switch the API under `.keepalive.lock` so cron cannot race the upgrade. Verify the health endpoint reports 1.1.1 and the current public model-list endpoint works. Neither check sends a Gemini generation request. Do not overwrite the active configuration with either example template.
+
+The image release bundles `curl_cffi 0.16.3` statically linked with upstream `libcurl-impersonate 2.2.2` (BoringSSL). Its build applies only FreeBSD architecture detection and libc++ link flags from upstream. `build-image-runtime.py` pins and verifies both source archives, and records the runtime source and wheel hashes. The installer checks the complete release manifest and all wheel hashes before installing. No library compilation is required when deploying the prepared release.
 
 To deploy the image release into an isolated test directory:
 
