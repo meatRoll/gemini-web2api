@@ -1,0 +1,19 @@
+{
+  "host": "0.0.0.0",
+  "port": 8081,
+  "cookie_file": "/run/gemini/auth.json",
+  "model_snapshot_file": "/run/gemini/models.json",
+  "default_model": "gemini-3.6-flash",
+  "retry_attempts": 1,
+  "retry_delay_sec": 60,
+  "request_timeout_sec": 120,
+  "agent_request_budget_sec": 120,
+  "stream_heartbeat_sec": 10,
+  "model_check_interval_sec": 0,
+  "cookie_rotation_interval_sec": 0,
+  "temporary_chats": true,
+  "auto_cache": false,
+  "cache_db_path": "/tmp/gemini-image-test-cache.sqlite3",
+  "api_keys": [],
+  "log_requests": true
+}
