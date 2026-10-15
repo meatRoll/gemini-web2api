@@ -140,8 +140,15 @@ def _upload_images(images: list) -> list:
     return file_refs if file_refs else None
 
 
+_UPSTREAM_RESPONSE_STARTED = object()
+
+
 def _stream_with_heartbeat(upstream):
     """Yield upstream deltas while keeping idle SSE connections active.
+
+    An iterator factory may accept a callback to signal the first upstream data
+    independently of model text. Events are consumed by the HTTP handler so only
+    that thread writes to the client connection.
 
     Some Serv00/front-door proxies close an otherwise healthy stream after about
     30 seconds without bytes.  Run the blocking upstream iterator separately so
@@ -160,18 +167,32 @@ def _stream_with_heartbeat(upstream):
                 continue
 
     def consume():
+        iterator = None
+        notified = False
+
+        def notify_first_response():
+            nonlocal notified
+            if not notified:
+                notified = True
+                publish(("item", _UPSTREAM_RESPONSE_STARTED))
+
         try:
-            for item in upstream:
+            iterator = upstream(notify_first_response) if callable(upstream) else upstream
+            for item in iterator:
                 if stopped.is_set():
                     break
                 publish(("item", item))
         except Exception as error:
             publish(("error", error))
         finally:
-            close = getattr(upstream, "close", None)
-            if close:
-                close()
-            publish(("done", None))
+            try:
+                close = getattr(iterator, "close", None)
+                if close:
+                    close()
+            except Exception as error:
+                publish(("error", error))
+            finally:
+                publish(("done", None))
 
     threading.Thread(target=consume, daemon=True).start()
     interval = max(0.01, float(CONFIG.get("stream_heartbeat_sec", 10)))
@@ -222,8 +243,11 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return True
 
     def _generate_buffered(self, prompt, model_id, think_mode, file_refs,
-                           extra_fields, model_name, request_id, tools_enabled):
+                           extra_fields, model_name, request_id, tools_enabled,
+                           on_first_response=None):
         kwargs = {"session_hash": _session_hash(model_name), "request_id": request_id}
+        if on_first_response is not None:
+            kwargs["on_first_response"] = on_first_response
         if not tools_enabled:
             return generate(prompt, model_id, think_mode, file_refs, extra_fields, **kwargs)
         if not _agent_slot.acquire(blocking=False):
@@ -272,17 +296,23 @@ class GeminiHandler(BaseHTTPRequestHandler):
         if not initial:
             log(f"stream_keepalive id={request_id} model={model_name} kind=data_chunk")
 
-    def _wait_with_heartbeat(self, operation, heartbeat=None):
+    def _send_sse_keepalive_comment(self):
+        self.wfile.write(b": keep-alive\n\n")
+        self.wfile.flush()
+
+    def _wait_with_heartbeat(self, operation, heartbeat=None, on_first_response=None):
         self._start_sse()
 
-        def result():
-            yield operation()
+        def result(notify=None):
+            yield operation(notify) if on_first_response is not None else operation()
 
-        for value in _stream_with_heartbeat(result()):
-            if value is None:
+        upstream = result if on_first_response is not None else result()
+        for value in _stream_with_heartbeat(upstream):
+            if value is _UPSTREAM_RESPONSE_STARTED:
+                on_first_response()
+            elif value is None:
                 if heartbeat is None:
-                    self.wfile.write(b": keep-alive\n\n")
-                    self.wfile.flush()
+                    self._send_sse_keepalive_comment()
                 else:
                     heartbeat()
             else:
@@ -503,32 +533,49 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
 
+        stream_started = False
+
+        def start_chat_stream(source="upstream_data"):
+            nonlocal stream_started
+            if not stream_started:
+                self._send_chat_stream_keepalive(cid, model_name, initial=True)
+                stream_started = True
+                log(f"stream_preamble id={cid} endpoint=chat kind=role_chunk source={source} "
+                    f"duration_ms={int((time.monotonic() - started_at) * 1000)}")
+
+        def keep_chat_stream_alive():
+            if stream_started:
+                self._send_chat_stream_keepalive(cid, model_name)
+            else:
+                self._send_sse_keepalive_comment()
+
         if stream and (not tools or tool_choice == "none"):
+            stream_text = ""
             try:
                 self._start_sse()
-                first_chunk = {
-                    "id": cid,
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": model_name,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {"role": "assistant"},
-                        "finish_reason": None,
-                    }],
-                }
-                self.wfile.write(f"data: {json.dumps(first_chunk)}\n\n".encode())
-                self.wfile.flush()
-                stream_text = ""
-                for delta in _stream_with_heartbeat(generate_stream(prompt, model_id, think_mode, file_refs, extra_fields, session_hash=_session_hash(model_name), request_id=cid)):
-                    if delta is None:
-                        self._send_chat_stream_keepalive(cid, model_name)
+                self._send_sse_keepalive_comment()
+
+                def upstream(notify):
+                    yield from generate_stream(
+                        prompt, model_id, think_mode, file_refs, extra_fields,
+                        session_hash=_session_hash(model_name), request_id=cid,
+                        on_first_response=notify,
+                    )
+
+                for delta in _stream_with_heartbeat(upstream):
+                    if delta is _UPSTREAM_RESPONSE_STARTED:
+                        start_chat_stream()
                         continue
+                    if delta is None:
+                        keep_chat_stream_alive()
+                        continue
+                    start_chat_stream(source="content")
                     stream_text += delta
                     chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                              "model": model_name, "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}]}
                     self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
                     self.wfile.flush()
+                start_chat_stream(source="complete")
                 end = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                        "model": model_name, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
                 self.wfile.write(f"data: {json.dumps(end)}\n\n".encode())
@@ -576,14 +623,18 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            operation = lambda: self._generate_buffered(prompt, model_id, think_mode, file_refs, extra_fields, model_name, cid, tools_enabled)
+            def operation(notify=None):
+                return self._generate_buffered(
+                    prompt, model_id, think_mode, file_refs, extra_fields,
+                    model_name, cid, tools_enabled, on_first_response=notify,
+                )
+
             if stream:
                 self._start_sse()
-                self._send_chat_stream_keepalive(cid, model_name, initial=True)
-                log(f"stream_preamble id={cid} endpoint=chat kind=role_chunk")
+                self._send_sse_keepalive_comment()
                 text = self._wait_with_heartbeat(
-                    operation,
-                    heartbeat=lambda: self._send_chat_stream_keepalive(cid, model_name),
+                    operation, heartbeat=keep_chat_stream_alive,
+                    on_first_response=start_chat_stream,
                 )
             else:
                 text = operation()
@@ -638,7 +689,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         if stream:
             self._start_sse()
-            # The preamble already established the assistant role for buffered streams.
+            start_chat_stream(source="complete")
             delta = {"content": text or None}
             if tool_calls:
                 delta["tool_calls"] = [

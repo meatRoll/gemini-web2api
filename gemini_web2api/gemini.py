@@ -304,10 +304,12 @@ def _extract_stream_deltas(line: str, emitted_raw_text: str) -> tuple:
     return emitted_raw_text, [delta for delta in deltas if delta]
 
 
-def _iter_response_lines(response):
-    """Yield complete response lines and flush a final unterminated line."""
+def _iter_response_lines(response, on_chunk=None):
+    """Yield complete lines, observing data before any line/text buffering."""
     buf = ""
     for chunk in response.iter_text():
+        if chunk and on_chunk is not None:
+            on_chunk()
         buf += chunk
         while "\n" in buf:
             line, buf = buf.split("\n", 1)
@@ -367,7 +369,7 @@ def extract_response_text(raw: str) -> str:
 
 
 
-def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None, session_hash: str = None, request_id: str = None, *, budget_sec: float = None, max_attempts: int = None, cancelled=None) -> str:
+def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None, session_hash: str = None, request_id: str = None, *, budget_sec: float = None, max_attempts: int = None, cancelled=None, on_first_response=None) -> str:
     """Non-streaming generation with retry."""
     load_cookie()
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
@@ -379,7 +381,9 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
 
     last_err = None
     trace_id = request_id or uuid.uuid4().hex[:10]
-    deadline = time.monotonic() + budget_sec if budget_sec is not None else None
+    started_at = time.monotonic()
+    first_response_received = False
+    deadline = started_at + budget_sec if budget_sec is not None else None
     attempts = max(1, max_attempts if max_attempts is not None else CONFIG["retry_attempts"])
     configured_timeout = max(0.001, float(CONFIG["request_timeout_sec"]))
     budget_label = f"{float(budget_sec):.3f}" if budget_sec is not None else "none"
@@ -423,7 +427,7 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
             response_status = getattr(resp, "status", getattr(resp, "code", "unknown"))
             phase = "read"
             try:
-                if deadline is None:
+                if deadline is None and on_first_response is None:
                     raw = resp.read().decode("utf-8", errors="replace")
                     response_bytes = len(raw.encode("utf-8"))
                 else:
@@ -431,16 +435,22 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
                     while True:
                         if cancelled and cancelled():
                             raise ConnectionAbortedError("Client disconnected during generation")
-                        remaining = deadline - time.monotonic()
-                        if remaining <= 0:
-                            raise TimeoutError("Generation budget exhausted")
-                        # urllib has no total read deadline; bound each underlying read.
-                        sock = getattr(getattr(getattr(resp, "fp", None), "raw", None), "_sock", None)
-                        if sock is not None:
-                            sock.settimeout(remaining)
+                        if deadline is not None:
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                raise TimeoutError("Generation budget exhausted")
+                            # urllib has no total read deadline; bound each underlying read.
+                            sock = getattr(getattr(getattr(resp, "fp", None), "raw", None), "_sock", None)
+                            if sock is not None:
+                                sock.settimeout(min(configured_timeout, remaining))
                         chunk = resp.read1(65536)
                         if not chunk:
                             break
+                        if on_first_response is not None and not first_response_received:
+                            first_response_received = True
+                            log(f"upstream_first_data transport=buffered id={trace_id} "
+                                f"duration_ms={int((time.monotonic() - started_at) * 1000)}")
+                            on_first_response()
                         parts.append(chunk)
                         response_bytes += len(chunk)
                     raw = b"".join(parts).decode("utf-8", errors="replace")
@@ -493,10 +503,11 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
     raise last_err
 
 
-def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None, session_hash: str = None, request_id: str = None):
+def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None, session_hash: str = None, request_id: str = None, *, on_first_response=None):
     """Streaming generation via httpx with retry on connection failure."""
     if not HAS_HTTPX:
-        text = generate(prompt, model_id, think_mode, file_refs, extra_fields, session_hash, request_id=request_id)
+        kwargs = {"on_first_response": on_first_response} if on_first_response is not None else {}
+        text = generate(prompt, model_id, think_mode, file_refs, extra_fields, session_hash, request_id=request_id, **kwargs)
         if text:
             yield text
         return
@@ -517,6 +528,18 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
         f"max_attempts={max(1, CONFIG['retry_attempts'])} {_selection_log_fields(selection)}"
     )
     emitted_raw_text = ""
+    started_at = time.monotonic()
+    first_response_received = False
+
+    def notify_first_response():
+        nonlocal first_response_received
+        if not first_response_received:
+            first_response_received = True
+            log(f"upstream_first_data transport=stream id={request_tag} "
+                f"duration_ms={int((time.monotonic() - started_at) * 1000)}")
+            if on_first_response is not None:
+                on_first_response()
+
     for attempt in range(max(1, CONFIG["retry_attempts"])):
         attempt_started = time.monotonic()
         frame_count = 0
@@ -534,7 +557,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                 response_status = getattr(resp, "status_code", "unknown")
                 resp.raise_for_status()
                 phase = "read"
-                for line in _iter_response_lines(resp):
+                for line in _iter_response_lines(resp, on_chunk=notify_first_response):
                     response_bytes += len(line.encode("utf-8"))
                     if '"wrb.fr"' in line:
                         frame_count += 1
