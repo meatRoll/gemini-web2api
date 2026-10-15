@@ -1,5 +1,6 @@
 #!/bin/sh
 set -eu
+export COPYFILE_DISABLE=1
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 out=${1:-"$root/../gemini-web2api-serv00.tar.gz"}

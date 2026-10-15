@@ -1,6 +1,7 @@
 #!/bin/sh
 # Bundle application source and a prepared FreeBSD amd64/Python 3.11 wheelhouse.
 set -eu
+export COPYFILE_DISABLE=1
 root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 if [ "$#" -lt 1 ]; then
     printf 'Usage: %s WHEELHOUSE [OUTPUT.tar.gz]\n' "$0" >&2
