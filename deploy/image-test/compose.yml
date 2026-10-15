@@ -1,0 +1,20 @@
+services:
+  image-test:
+    image: ${GEMINI_TEST_IMAGE:-ghcr.io/meatroll/gemini-web2api:feat-multimodal-image-input}
+    ports:
+      - "127.0.0.1:${GEMINI_TEST_PORT:-18081}:8081"
+    volumes:
+      - ./config.example.json:/app/config.json:ro
+      - ${GEMINI_TEST_AUTH_FILE:?Set GEMINI_TEST_AUTH_FILE to a private authentication export}:/run/gemini/auth.json:ro
+      - ${GEMINI_TEST_MODEL_SNAPSHOT_FILE:-/dev/null}:/run/gemini/models.json:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    mem_limit: 256m
+    cpus: 0.5
+    pids_limit: 64
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
