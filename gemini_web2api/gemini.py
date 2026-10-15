@@ -91,6 +91,33 @@ def _retry_delay(attempt: int) -> float:
     cap = max(base, float(CONFIG.get("retry_delay_max_sec", 30)))
     return min(cap, base * (2 ** attempt)) + random.uniform(0, min(1.0, base / 4))
 
+
+def safe_error_message(error: BaseException, limit: int = 300) -> str:
+    """Return a bounded error message with credential-like values redacted."""
+    message = str(error).replace("\n", " ").replace("\r", " ")
+    message = re.sub(
+        r"(?i)(cookie|token|api[_-]?key|authorization|secret|password|xsrf)\s*[:=]\s*[^\s,;]+",
+        r"\1=[REDACTED]",
+        message,
+    )
+    return message[:limit] or type(error).__name__
+
+
+def _selection_log_fields(selection) -> str:
+    """Describe dynamic model routing without logging the complete selection header."""
+    if not isinstance(selection, dict):
+        return "selection=legacy"
+    header = selection.get("header")
+    if not isinstance(header, list):
+        return "selection=invalid"
+    model_id = header[4] if len(header) > 4 and isinstance(header[4], str) else "unknown"
+    capacity = header[11] if len(header) > 11 and isinstance(header[11], int) else "unknown"
+    model_number = header[14] if len(header) > 14 and isinstance(header[14], int) else "unknown"
+    return (
+        f"selection=dynamic upstream_model_id={model_id} "
+        f"selection_capacity={capacity} selection_number={model_number}"
+    )
+
 def load_cookie() -> tuple:
     """Load cookie from file with mtime-based caching."""
     cookie_file = CONFIG.get("cookie_file")
@@ -352,22 +379,39 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
 
     last_err = None
     trace_id = request_id or uuid.uuid4().hex[:10]
+    deadline = time.monotonic() + budget_sec if budget_sec is not None else None
+    attempts = max(1, max_attempts if max_attempts is not None else CONFIG["retry_attempts"])
+    configured_timeout = max(0.001, float(CONFIG["request_timeout_sec"]))
+    budget_label = f"{float(budget_sec):.3f}" if budget_sec is not None else "none"
     log(
         f"upstream_start transport=buffered id={trace_id} "
-        f"request_bytes={len(body)}"
+        f"request_bytes={len(body)} budget_sec={budget_label} "
+        f"request_timeout_sec={configured_timeout:.3f} max_attempts={attempts} "
+        f"{_selection_log_fields(selection)}"
     )
-    deadline = time.monotonic() + budget_sec if budget_sec is not None else None
-    attempts = max_attempts if max_attempts is not None else CONFIG["retry_attempts"]
     for attempt in range(attempts):
+        attempt_started = time.monotonic()
+        phase = "preflight"
+        response_status = "unknown"
+        response_bytes = 0
         try:
             if cancelled and cancelled():
                 raise ConnectionAbortedError("Client disconnected before generation")
-            timeout = CONFIG["request_timeout_sec"]
+            timeout = configured_timeout
+            remaining = None
             if deadline is not None:
-                timeout = min(timeout, deadline - time.monotonic())
+                remaining = deadline - time.monotonic()
+                timeout = min(timeout, remaining)
                 if timeout <= 0:
                     raise TimeoutError("Generation budget exhausted")
+            remaining_label = f"{remaining:.3f}" if remaining is not None else "none"
+            log(
+                f"upstream_attempt transport=buffered id={trace_id} "
+                f"attempt={attempt + 1}/{attempts} phase=open timeout_sec={timeout:.3f} "
+                f"budget_remaining_sec={remaining_label}"
+            )
             req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+            phase = "open"
             if proxy:
                 opener = urllib.request.build_opener(
                     urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
@@ -376,9 +420,12 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
                 resp = opener.open(req, timeout=timeout)
             else:
                 resp = urllib.request.urlopen(req, context=ctx, timeout=timeout)
+            response_status = getattr(resp, "status", getattr(resp, "code", "unknown"))
+            phase = "read"
             try:
                 if deadline is None:
                     raw = resp.read().decode("utf-8", errors="replace")
+                    response_bytes = len(raw.encode("utf-8"))
                 else:
                     parts = []
                     while True:
@@ -395,14 +442,18 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
                         if not chunk:
                             break
                         parts.append(chunk)
+                        response_bytes += len(chunk)
                     raw = b"".join(parts).decode("utf-8", errors="replace")
             finally:
                 resp.close()
+            phase = "parse"
             candidate_count, candidate_chars, longest_chars, tail_lengths, repeated_prefix = _response_candidate_stats(raw)
             text = extract_response_text(raw)
             log(
                 f"upstream_finish transport=buffered id={trace_id} attempt={attempt + 1} "
-                f"raw_bytes={len(raw.encode('utf-8'))} frames={sum(1 for line in raw.split(chr(10)) if chr(34)+'wrb.fr'+chr(34) in line)} "
+                f"duration_ms={int((time.monotonic() - attempt_started) * 1000)} "
+                f"http_status={response_status} response_bytes={response_bytes} "
+                f"frames={sum(1 for line in raw.split(chr(10)) if chr(34)+'wrb.fr'+chr(34) in line)} "
                 f"candidates={candidate_count} candidate_chars={candidate_chars} "
                 f"longest_chars={longest_chars} tail_lengths={tail_lengths} "
                 f"repeated_prefix={repeated_prefix} extracted_chars={len(text)}"
@@ -410,9 +461,22 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
             return text
         except Exception as e:
             last_err = e
+            remaining = deadline - time.monotonic() if deadline is not None else None
+            remaining_label = f"{remaining:.3f}" if remaining is not None else "none"
+            budget_exhausted = remaining is not None and remaining <= 0
+            error_status = getattr(e, "code", response_status)
+            if isinstance(e, TimeoutError):
+                timeout_reason = "budget_exhausted" if budget_exhausted else "upstream_timeout"
+            elif isinstance(e, ConnectionAbortedError):
+                timeout_reason = "client_disconnected"
+            else:
+                timeout_reason = "none"
             log(
-                f"upstream_error transport=buffered id={trace_id} attempt={attempt + 1} "
-                f"type={type(e).__name__} error={str(e).replace(chr(10), ' ')[:300]}"
+                f"upstream_error transport=buffered id={trace_id} attempt={attempt + 1}/{attempts} "
+                f"duration_ms={int((time.monotonic() - attempt_started) * 1000)} phase={phase} "
+                f"http_status={error_status} response_bytes={response_bytes} "
+                f"budget_remaining_sec={remaining_label} error_type={type(e).__name__} "
+                f"timeout_reason={timeout_reason} error={safe_error_message(e)}"
             )
             if isinstance(e, (TimeoutError, ConnectionAbortedError)):
                 raise
@@ -420,7 +484,11 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
                 delay = _retry_delay(attempt)
                 if deadline is not None and time.monotonic() + delay >= deadline:
                     raise TimeoutError("Generation budget exhausted") from e
-                log(f"Retry {attempt+1}/{attempts} in {delay:.2f}s: {e}")
+                log(
+                    f"upstream_retry transport=buffered id={trace_id} "
+                    f"after_attempt={attempt + 1} next_attempt={attempt + 2} "
+                    f"delay_sec={delay:.3f} error_type={type(e).__name__}"
+                )
                 time.sleep(delay)
     raise last_err
 
@@ -444,16 +512,28 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
     request_tag = request_id or uuid.uuid4().hex[:10]
     log(
         f"upstream_start transport=stream tag={request_tag} "
-        f"request_bytes={len(body.encode('utf-8'))}"
+        f"request_bytes={len(body.encode('utf-8'))} "
+        f"request_timeout_sec={float(CONFIG['request_timeout_sec']):.3f} "
+        f"max_attempts={max(1, CONFIG['retry_attempts'])} {_selection_log_fields(selection)}"
     )
     emitted_raw_text = ""
-    for attempt in range(CONFIG["retry_attempts"]):
+    for attempt in range(max(1, CONFIG["retry_attempts"])):
+        attempt_started = time.monotonic()
         frame_count = 0
         response_bytes = 0
         text_frame_count = 0
+        phase = "open"
+        response_status = "unknown"
+        log(
+            f"upstream_attempt transport=stream tag={request_tag} "
+            f"attempt={attempt + 1}/{max(1, CONFIG['retry_attempts'])} phase=open "
+            f"timeout_sec={float(CONFIG['request_timeout_sec']):.3f}"
+        )
         try:
             with client.stream("POST", url, content=body, headers=headers) as resp:
+                response_status = getattr(resp, "status_code", "unknown")
                 resp.raise_for_status()
+                phase = "read"
                 for line in _iter_response_lines(resp):
                     response_bytes += len(line.encode("utf-8"))
                     if '"wrb.fr"' in line:
@@ -466,25 +546,33 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                         yield delta
             log(
                 f"upstream_finish transport=stream tag={request_tag} attempt={attempt + 1} "
-                f"response_bytes={response_bytes} frames={frame_count} "
+                f"duration_ms={int((time.monotonic() - attempt_started) * 1000)} "
+                f"http_status={response_status} response_bytes={response_bytes} frames={frame_count} "
                 f"text_frames={text_frame_count} emitted_chars={len(emitted_raw_text)}"
             )
             return
         except Exception as e:
             last_err = e
             log(
-                f"upstream_error transport=stream tag={request_tag} attempt={attempt + 1} "
+                f"upstream_error transport=stream tag={request_tag} attempt={attempt + 1}/"
+                f"{max(1, CONFIG['retry_attempts'])} "
+                f"duration_ms={int((time.monotonic() - attempt_started) * 1000)} phase={phase} "
+                f"http_status={getattr(e, 'response', None).status_code if getattr(e, 'response', None) is not None else response_status} "
                 f"response_bytes={response_bytes} frames={frame_count} "
                 f"text_frames={text_frame_count} emitted_chars={len(emitted_raw_text)} "
-                f"type={type(e).__name__} error={str(e).replace(chr(10), ' ')[:300]}"
+                f"error_type={type(e).__name__} error={safe_error_message(e)}"
             )
             # Once bytes have been delivered, restarting would duplicate or
             # replace already visible model output. Let the API layer report a
             # terminal stream error instead.
             if emitted_raw_text:
                 raise
-            if attempt < CONFIG["retry_attempts"] - 1:
+            if attempt < max(1, CONFIG["retry_attempts"]) - 1:
                 delay = _retry_delay(attempt)
-                log(f"Stream retry {attempt+1}/{CONFIG['retry_attempts']} in {delay:.2f}s: {e}")
+                log(
+                    f"upstream_retry transport=stream tag={request_tag} "
+                    f"after_attempt={attempt + 1} next_attempt={attempt + 2} "
+                    f"delay_sec={delay:.3f} error_type={type(e).__name__}"
+                )
                 time.sleep(delay)
     raise last_err
