@@ -16,6 +16,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run offline regression tests
+        run: |
+          python -m pip install -r requirements.txt pytest
+          python -m pytest -q
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
         with:
@@ -37,6 +46,7 @@ jobs:
           tags: |
             type=ref,event=branch
             type=ref,event=tag
+            type=sha
             type=raw,value=latest,enable={{is_default_branch}}
 
       - uses: docker/build-push-action@v6
@@ -46,3 +56,28 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Check isolated image startup without upstream calls
+        env:
+          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          read -r test_image <<< "$IMAGE_TAGS"
+          docker pull "$test_image"
+          trap 'docker rm -f gemini-image-smoke >/dev/null 2>&1 || true' EXIT
+          docker run -d --name gemini-image-smoke --read-only --tmpfs /tmp \
+            -v "$PWD/deploy/image-test/config.example.json:/app/config.json:ro" "$test_image"
+          docker exec -i gemini-image-smoke python - <<'PY'
+          import json, time, urllib.request
+          from gemini_web2api.gemini import HAS_CURL_CFFI
+          assert HAS_CURL_CFFI, "Chrome transport unavailable in image"
+          for attempt in range(20):
+              try:
+                  with urllib.request.urlopen("http://127.0.0.1:8081/", timeout=2) as response:
+                      assert json.load(response)["status"] == "ok"
+                  print("Container startup passed; no upstream generation requests")
+                  break
+              except OSError:
+                  if attempt == 19:
+                      raise
+                  time.sleep(0.5)
+          PY
