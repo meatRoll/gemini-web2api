@@ -617,6 +617,8 @@ class StreamingEndpointTests(unittest.TestCase):
         from gemini_web2api.generated_image import GeneratedImage
         context = [None] * 23
         context[0] = 22
+        context[1] = "upstream prompt"
+        context[16] = 0
         image = GeneratedImage(
             "https://lh3.googleusercontent.com/generated",
             image_id="http://googleusercontent.com/image_generation_content/0_799",
@@ -631,7 +633,7 @@ class StreamingEndpointTests(unittest.TestCase):
         payload = gemini._build_full_size_rpc_payload(image)
         self.assertEqual(payload[0][0][3][5], "image-signature")
         self.assertEqual(payload[0][1], [image.image_id, 0])
-        self.assertEqual(payload[0][3][1], "a red circle")
+        self.assertEqual(payload[0][3][1], "upstream prompt")
         self.assertEqual(payload[0][3][16], 0)
         self.assertIsNone(payload[0][3][20])
         self.assertEqual(payload[1][4], "session-1")
