@@ -604,6 +604,7 @@ class StreamingEndpointTests(unittest.TestCase):
         )
         status, _, body = self.post_json("/v1/images/generations", {
             "prompt": "a red fox", "response_format": "b64_json",
+            "size": "1024x1024", "quality": "high", "background": "opaque",
         })
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["data"][0]["b64_json"], "iVBORw0KGgo=")
