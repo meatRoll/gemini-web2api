@@ -580,6 +580,38 @@ def _batch_response_url(raw: str) -> str:
     raise ValueError("full-size image RPC returned no URL")
 
 
+def _build_full_size_rpc_payload(image) -> list:
+    """Build c8o8Fe's rich generated-image payload when metadata is available."""
+    rpc_info = getattr(image, "rpc_payload", None)
+    if isinstance(rpc_info, dict):
+        signature = rpc_info.get("signature")
+        context = rpc_info.get("context")
+        if isinstance(signature, str) and signature and isinstance(context, list):
+            context = list(context)
+            if len(context) > 1:
+                context[1] = rpc_info.get("prompt", "")
+            if len(context) > 16:
+                context[16] = 0
+            if len(context) > 20:
+                context[20] = None
+            session_id = rpc_info.get("session_id")
+            if not isinstance(session_id, str) or not session_id:
+                alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
+                session_id = "".join(secrets.choice(alphabet) for _ in range(16))
+            return [
+                [[None, None, None, [None, None, None, None, None, signature]],
+                 [image.image_id, 0], None, context, None, None, None, None,
+                 rpc_info.get("content_id", ""), session_id],
+                [image.rid, image.rcid, image.cid, None, session_id],
+                1, 0, 1,
+            ]
+    return [
+        [[None, None, None, [None, None, None, None, None, ""]], [image.image_id, 0],
+         None, [19, ""], None, None, None, None, None, ""],
+        [image.rid, image.rcid, image.cid, None, ""], 1, 0, 1,
+    ]
+
+
 def get_full_size_image(image) -> str | None:
     """Ask Gemini's c8o8Fe RPC for a full-size generated-image URL."""
     if not HAS_CURL_CFFI or not all(isinstance(value, str) and value for value in
@@ -588,11 +620,7 @@ def get_full_size_image(image) -> str | None:
     try:
         from .multimodal import _cached_page_tokens
         page_tokens = _cached_page_tokens(max_age=0)
-        payload = [
-            [[None, None, None, [None, None, None, None, None, ""]], [image.image_id, 0],
-             None, [19, ""], None, None, None, None, None, ""],
-            [image.rid, image.rcid, image.cid, None, ""], 1, 0, 1,
-        ]
+        payload = _build_full_size_rpc_payload(image)
         rpc = ["c8o8Fe", json.dumps(payload), None, "generic"]
         params = {
             "rpcids": "c8o8Fe", "hl": "en", "_reqid": int(time.time()) % 1000000,

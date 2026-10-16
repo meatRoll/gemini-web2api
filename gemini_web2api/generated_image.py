@@ -80,6 +80,7 @@ class GeneratedImage:
     cid: str = ""
     rid: str = ""
     rcid: str = ""
+    rpc_payload: Any = None
 
 
 @dataclass
@@ -123,6 +124,33 @@ def _wrb_payloads(raw: str):
             continue
 
 
+def _find_rpc_entry(value: Any):
+    """Find the rich image record used by Gemini's c8o8Fe RPC."""
+    best = None
+    best_score = -1
+
+    def visit(node):
+        nonlocal best, best_score
+        if not isinstance(node, list):
+            return
+        context = _nested(node, [3], None)
+        refs = _nested(node, [1], [])
+        content_id = _nested(node, [8], "")
+        if (isinstance(context, list) and _nested(context, [0], None) == 22
+                and isinstance(refs, list) and refs
+                and isinstance(_nested(refs, [0], ""), str)
+                and _nested(refs, [0], "").startswith("http://googleusercontent.com/image_generation_content/")
+                and isinstance(content_id, str) and content_id.startswith("im_")):
+            score = 2 if isinstance(_nested(context, [1], None), str) and _nested(context, [1], "") else 1
+            if score > best_score:
+                best, best_score = node, score
+        for child in node:
+            visit(child)
+
+    visit(value)
+    return best
+
+
 def extract_generation_result(raw: str, clean_text) -> GenerationResult:
     """Parse text and generated-image metadata from StreamGenerate response frames.
 
@@ -140,6 +168,8 @@ def extract_generation_result(raw: str, clean_text) -> GenerationResult:
     seen = set()
     cid = rid = ""
     for frame in _wrb_payloads(raw):
+        rpc_prompt = _nested(frame, [0, 0, 2, 0, 0], "")
+        rpc_entry = _find_rpc_entry(frame)
         metadata = _nested(frame, [1], [])
         if isinstance(metadata, list):
             cid = _nested(metadata, [0], cid) or cid
@@ -191,12 +221,32 @@ def extract_generation_result(raw: str, clean_text) -> GenerationResult:
                     alt = _nested(image_entry, [0, 3, 2], "")
                     if not isinstance(alt, str) or not alt:
                         alt = _nested(image_entry, [3, 2], "")
+                    rpc_payload = None
+                    if isinstance(rpc_entry, list):
+                        image_metadata = _nested(rpc_entry, [0, image_index, 3], [])
+                        if not isinstance(image_metadata, list) or not image_metadata:
+                            image_metadata = _nested(rpc_entry, [0, 3], [])
+                        signature = _nested(image_metadata, [5], "")
+                        context = _nested(rpc_entry, [3], None)
+                        content_id = _nested(rpc_entry, [8], "")
+                        prompt = _nested(context, [1], "") if isinstance(context, list) else ""
+                        if not prompt:
+                            prompt = rpc_prompt if isinstance(rpc_prompt, str) else ""
+                        if (isinstance(signature, str) and signature
+                                and isinstance(context, list)):
+                            rpc_payload = {
+                                "signature": signature,
+                                "context": context,
+                                "prompt": prompt,
+                                "content_id": content_id if isinstance(content_id, str) else "",
+                            }
                     images.append(GeneratedImage(
                         url=url, alt=alt if isinstance(alt, str) else "",
                         image_id=image_id,
                         cid=cid if isinstance(cid, str) else "",
                         rid=rid if isinstance(rid, str) else "",
                         rcid=rcid if isinstance(rcid, str) else "",
+                        rpc_payload=rpc_payload,
                     ))
     return GenerationResult(text=clean_text(text), images=images, raw=raw)
 
