@@ -580,6 +580,22 @@ def _batch_response_url(raw: str) -> str:
     raise ValueError("full-size image RPC returned no URL")
 
 
+def _build_full_size_rpc_headers(page_tokens: dict, session_uuid: str) -> dict:
+    """Build the c8o8Fe-specific browser model header from the HAR shape."""
+    build = CONFIG.get("gemini_bl", "")
+    header = [
+        1, None, None, None, None, None, None, 0,
+        [4, 5, 6, 8, 16, 19, 20, 4, 5, 6, 8, 16, 19, 20],
+        None, None, None, None, None, 6, 1, session_uuid,
+        [build], None,
+        [[None, 2200000], [int(time.time()), 108000000]],
+    ]
+    return {
+        "x-goog-ext-525001261-jspb": json.dumps(header),
+        "x-goog-ext-73010989-jspb": "[0]",
+    }
+
+
 def _build_full_size_rpc_payload(image) -> list:
     """Build c8o8Fe's rich generated-image payload when metadata is available."""
     rpc_info = getattr(image, "rpc_payload", None)
@@ -622,9 +638,13 @@ def get_full_size_image(image) -> str | None:
         page_tokens = _cached_page_tokens(max_age=0)
         payload = _build_full_size_rpc_payload(image)
         rpc = ["c8o8Fe", json.dumps(payload), None, "generic"]
+        session_uuid = str(uuid.uuid4()).upper()
+        headers = _build_headers()
+        headers.update(_build_full_size_rpc_headers(page_tokens, session_uuid))
+        conversation_id = image.cid[2:] if image.cid.startswith("c_") else image.cid
         params = {
-            "rpcids": "c8o8Fe", "hl": "en", "_reqid": int(time.time()) % 1000000,
-            "rt": "c", "source-path": f"{_account_prefix()}/app/{image.cid}",
+            "rpcids": "c8o8Fe", "hl": "zh-CN", "_reqid": int(time.time()) % 1000000,
+            "rt": "c", "source-path": f"{_account_prefix()}/app/{conversation_id}",
             "bl": CONFIG["gemini_bl"],
         }
         if page_tokens.get("f_sid"):
@@ -633,8 +653,6 @@ def get_full_size_image(image) -> str | None:
             "f.req": json.dumps([[rpc]]),
             "at": page_tokens.get("at") or CONFIG.get("xsrf_token") or "",
         })
-        headers = _build_headers(str(uuid.uuid4()).upper())
-        headers.update(_image_model_headers(page_tokens))
         args = {"data": body, "headers": headers,
                 "timeout": CONFIG["request_timeout_sec"], "impersonate": "chrome"}
         if CONFIG.get("proxy"):

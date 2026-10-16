@@ -334,8 +334,14 @@ def _request_args(stream: bool) -> dict:
     args = {
         "headers": {
             "Accept": "*/*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,ja;q=0.7",
+            "Cache-Control": "no-cache",
             "Origin": "https://gemini.google.com",
+            "Pragma": "no-cache",
             "Referer": "https://gemini.google.com/",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "cross-site",
         },
         "timeout": CONFIG["request_timeout_sec"],
         "impersonate": "chrome",
