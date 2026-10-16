@@ -664,6 +664,24 @@ class StreamingEndpointTests(unittest.TestCase):
         ])
         generate_image_structured.assert_called_once_with("a red fox")
 
+    @mock.patch("gemini_web2api.server.download_generated_image")
+    @mock.patch("gemini_web2api.server.get_full_size_image", return_value="https://lh3.googleusercontent.com/raw")
+    @mock.patch("gemini_web2api.server.generate_image_structured")
+    def test_image_generation_url_returns_raw_source_for_local_download(
+        self, generate_image_structured, _full_size, download_generated_image
+    ):
+        from gemini_web2api.generated_image import GeneratedImage, GenerationResult
+        generate_image_structured.return_value = GenerationResult(
+            images=[GeneratedImage("https://lh3.googleusercontent.com/preview")]
+        )
+        status, _, body = self.post_json("/v1/images/generations", {
+            "prompt": "a red fox", "response_format": "url",
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["data"][0]["url"], "https://lh3.googleusercontent.com/raw")
+        download_generated_image.assert_not_called()
+
+
     @mock.patch("gemini_web2api.server.download_generated_image", return_value=(b"\x89PNG\r\n\x1a\n", "image/png"))
     @mock.patch("gemini_web2api.server.get_full_size_image", return_value=None)
     @mock.patch("gemini_web2api.server.generate_image_structured")

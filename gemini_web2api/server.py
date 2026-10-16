@@ -17,7 +17,7 @@ from .config import CONFIG
 from .models import get_models, resolve_model
 from .gemini import (GeminiUpstreamError, generate, generate_stream, generate_image_structured,
                      get_full_size_image, log, _session_hash, safe_error_message)
-from .generated_image import download_generated_image, resolve_generated_image_url
+from .generated_image import download_generated_image
 from .tools import has_tool_call_marker, valid_tool_call_candidate, validate_tool_calls
 from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
 from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
@@ -78,7 +78,9 @@ def _generated_image_payload(image, response_format: str):
     for index, (source_kind, source_url) in enumerate(candidates):
         try:
             if response_format == "url":
-                data = {"url": resolve_generated_image_url(source_url)}
+                # The caller may have a browser-side proxy that can access the
+                # signed Gemini delivery chain; keep the raw source URL intact.
+                data = {"url": source_url}
             else:
                 import base64
                 image_bytes, _mime = download_generated_image(source_url)
