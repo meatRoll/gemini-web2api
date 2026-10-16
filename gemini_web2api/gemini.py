@@ -608,6 +608,8 @@ def _build_full_size_rpc_payload(image) -> list:
             if not isinstance(session_id, str) or not session_id:
                 alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
                 session_id = "".join(secrets.choice(alphabet) for _ in range(16))
+            if len(context) > 9:
+                context[9] = session_id
             return [
                 [[None, None, None, [None, None, None, None, None, signature]],
                  [image.image_id, 0], None, context, None, None, None, None,
