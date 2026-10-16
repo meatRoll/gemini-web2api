@@ -395,7 +395,9 @@ resp = client.chat.completions.create(
 
 模块版服务支持 `POST /v1/images/generations`，接受 `prompt`、`n: 1` 和
 `response_format`（`b64_json` 或 `url`）。图片请求使用 Gemini Web 专用的浏览器请求格式，
-返回一个 OpenAI 兼容的图片结果。暂不支持 `stream`、`size`、`quality`、`style`、图片编辑和多图输出。
+返回一个 OpenAI 兼容的图片结果。为兼容标准 OpenAI Images 客户端，也接受 `size`、`quality`、
+`style`、`background` 等常见参数，但这些参数目前由 Gemini 后端忽略。暂不支持 `stream`、
+图片编辑和多图输出。
 
 Responses API 的 `tools` 中也支持 `{"type": "image_generation"}`，返回包含 base64 结果的
 `image_generation_call`。Chat Completions 会识别类似 `generate an image of ...` 的明确请求，

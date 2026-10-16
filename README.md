@@ -436,8 +436,10 @@ resp = client.chat.completions.create(
 
 The modular server supports `POST /v1/images/generations` with `prompt`, `n: 1`, and
 `response_format` set to `b64_json` or `url`. The image route uses Gemini Web's dedicated
-browser request shape and returns one OpenAI-compatible image result. `stream`, `size`,
-`quality`, `style`, image editing, and multiple outputs are not supported.
+browser request shape and returns one OpenAI-compatible image result. It accepts common
+OpenAI Images options such as `size`, `quality`, `style`, and `background` for client
+compatibility; these options are currently ignored by the Gemini backend. `stream`, image
+editing, and multiple outputs are not supported.
 
 The Responses API also accepts `{"type": "image_generation"}` in `tools` and returns an
 `image_generation_call` containing base64 output. Chat Completions recognizes explicit

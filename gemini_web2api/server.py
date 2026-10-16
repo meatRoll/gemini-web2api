@@ -544,12 +544,24 @@ class GeminiHandler(BaseHTTPRequestHandler):
         if not isinstance(req, dict):
             self.send_json({"error": {"message": "invalid JSON"}}, 400)
             return
-        unsupported = [name for name in ("stream", "size", "quality", "style") if name in req]
-        unexpected = set(req) - {"prompt", "model", "n", "response_format"}
+        # OpenAI Images clients commonly send these options even when the backend
+        # cannot control them. Accept them for compatibility and keep the current
+        # Gemini generation behavior; the values are intentionally ignored.
+        ignored_compat_fields = {
+            "size", "quality", "style", "background", "moderation",
+            "output_format", "output_compression", "user",
+        }
+        unsupported = [name for name in ("stream",) if name in req]
+        unexpected = set(req) - {
+            "prompt", "model", "n", "response_format", *ignored_compat_fields,
+        }
         prompt = req.get("prompt")
         if (unsupported or unexpected or not isinstance(prompt, str) or not prompt.strip()):
             self.send_json({"error": {"message": "invalid image generation request"}}, 400)
             return
+        ignored_fields = sorted(set(req).intersection(ignored_compat_fields))
+        if ignored_fields:
+            log("image_generation_compat ignored_fields=%s" % ",".join(ignored_fields))
         if "n" in req and (not isinstance(req["n"], int) or isinstance(req["n"], bool) or req["n"] != 1):
             self.send_json({"error": {"message": "only n=1 is supported"}}, 400)
             return
