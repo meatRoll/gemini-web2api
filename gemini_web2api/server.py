@@ -9,6 +9,7 @@ import select
 import socket
 import threading
 import queue
+from urllib.parse import urlsplit
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
@@ -67,6 +68,9 @@ def _generated_image_output(prompt: str, response_format: str):
     if not result.images:
         raise RuntimeError("Gemini returned no generated image metadata")
     source_url = get_full_size_image(result.images[0]) or result.images[0].url
+    log("image_generation_result images=%s selected_full_size=%s response_format=%s source_host=%s source_path=%s" % (
+        len(result.images), bool(result.images[0].cid and result.images[0].rid and result.images[0].rcid and result.images[0].image_id),
+        response_format, (urlsplit(source_url).hostname or "-"), (urlsplit(source_url).path or "/")))
     if response_format == "url":
         data = {"url": resolve_generated_image_url(source_url)}
     else:
