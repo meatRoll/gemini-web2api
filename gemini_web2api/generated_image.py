@@ -291,8 +291,20 @@ def _validate_mediator_url(url: str) -> str:
     return _validated_https_url(url, _MEDIATOR_GENERATED_IMAGE_HOSTS)
 
 
+def _with_web_image_variant(url: str) -> str:
+    """Match Gemini Web's ``=d-I`` variant before fetching a raw /gg URL."""
+    parsed = urlsplit(url)
+    path = parsed.path
+    if path.startswith(("/gg/", "/gg-dl/")):
+        segment = path.rsplit("/", 1)[-1]
+        if "=" not in segment:
+            path += "=d-I"
+    return urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, parsed.fragment))
+
+
 def _with_alr(url: str) -> str:
     """Match Gemini Web's image-loader flag on every generated-image hop."""
+    url = _with_web_image_variant(url)
     parsed = urlsplit(url)
     query = parse_qsl(parsed.query, keep_blank_values=True)
     if not any(key == "alr" for key, _value in query):

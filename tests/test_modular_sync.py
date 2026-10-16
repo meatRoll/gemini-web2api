@@ -594,7 +594,16 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(_classify_response_quality("", 'Quoted: I seem to be encountering an error.', True), "normal")
         self.assertEqual(_classify_response_quality("", "I couldn't do that because it is unsafe.", True), "normal")
 
-    def test_full_size_rpc_headers_match_rich_image_shape(self):
+    def test_generated_image_loader_adds_d_i_variant_to_raw_rpc_url(self):
+        from gemini_web2api.generated_image import _with_alr
+        raw = "https://lh3.googleusercontent.com/gg-dl/signed-token"
+        self.assertEqual(_with_alr(raw), raw + "=d-I?alr=yes")
+        preview = "https://lh3.googleusercontent.com/gg-dl/signed-token=s1024-rj"
+        self.assertEqual(_with_alr(preview), preview + "?alr=yes")
+        mediator = "https://lh3.googleusercontent.com/rd-gg-dl/signed-token=s0-d-I"
+        self.assertEqual(_with_alr(mediator), mediator + "?alr=yes")
+
+
         headers = gemini._build_full_size_rpc_headers({}, "A" * 36)
         header = json.loads(headers["x-goog-ext-525001261-jspb"])
         self.assertEqual(len(header), 20)
