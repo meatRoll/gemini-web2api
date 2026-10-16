@@ -68,7 +68,10 @@ def _get_page_tokens(timeout=30) -> dict:
                 if match:
                     tokens[key] = json.loads('"' + match.group(1) + '"')
                     break
-        build = re.search(r'boq_assistant-bard-web-server_[0-9.]+_p[0-9]+', html)
+        build = re.search(
+            r'boq_(?:assistant-bard-web-server|gemini-web-uiserver)_[0-9.]+_p[0-9]+',
+            html,
+        )
         if build:
             CONFIG["gemini_bl"] = build.group()
         return tokens

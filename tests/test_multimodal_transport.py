@@ -188,6 +188,13 @@ class PageTokenTests(unittest.TestCase):
                 self.assertEqual(request.call_args.kwargs["timeout"], 5)
                 self.assertTrue(response.closed)
 
+    def test_page_tokens_accept_current_gemini_web_build(self):
+        html = b'"FdrFJe":"sid","SNlM0e":"token","boq_gemini-web-uiserver_20261014.17_p0"'
+        with mock.patch.object(multimodal.urllib.request, "urlopen", return_value=io.BytesIO(html)):
+            tokens = multimodal._get_page_tokens(timeout=5)
+        self.assertEqual(tokens, {"f_sid": "sid", "at": "token"})
+        self.assertEqual(CONFIG["gemini_bl"], "boq_gemini-web-uiserver_20261014.17_p0")
+
     def test_token_cache_does_not_cross_accounts_and_force_refresh_works(self):
         multimodal._page_tokens_cache.update(tokens={}, ts=0, scope=None)
         with mock.patch.object(multimodal, "_get_page_tokens", side_effect=[{"at": "one"}, {"at": "two"}, {"at": "three"}]) as fetch:
