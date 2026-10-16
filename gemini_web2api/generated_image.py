@@ -1,6 +1,7 @@
 """Parsing and bounded download helpers for Gemini-generated images."""
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import re
@@ -28,6 +29,41 @@ _MAGIC_MIMES = (
     (b"\x89PNG\r\n\x1a\n", "image/png"),
     (b"\xff\xd8\xff", "image/jpeg"),
 )
+
+
+def _diagnostic_log(message: str) -> None:
+    """Write image-download diagnostics through the service logger."""
+    try:
+        # Import lazily because gemini.py imports this module during startup.
+        from .gemini import log
+        log("image_download " + message)
+    except Exception:
+        return
+
+
+def _url_debug(url: str) -> str:
+    """Return URL metadata without exposing signed query values."""
+    try:
+        parsed = urlsplit(url)
+        query_keys = sorted({part.split("=", 1)[0] for part in parsed.query.split("&") if part})
+        return "host=%s path=%s query_keys=%s url_sha256=%s" % (
+            parsed.hostname or "", parsed.path or "/", ",".join(query_keys) or "-",
+            hashlib.sha256(url.encode("utf-8")).hexdigest()[:12],
+        )
+    except Exception:
+        return "url_sha256=%s" % hashlib.sha256(str(url).encode("utf-8")).hexdigest()[:12]
+
+
+def _response_debug(response) -> str:
+    headers = getattr(response, "headers", {})
+    content_type = headers.get("Content-Type", "-")
+    content_length = headers.get("Content-Length", "-")
+    location = headers.get("Location")
+    location_debug = _url_debug(urljoin("https://placeholder.invalid/", location)) if location else "-"
+    return "status=%s content_type=%s content_length=%s location=%s server=%s" % (
+        getattr(response, "status_code", "-"), content_type, content_length, location_debug,
+        headers.get("Server", "-"),
+    )
 
 
 @dataclass(frozen=True)
@@ -252,13 +288,18 @@ def resolve_generated_image_url(url: str) -> str:
     if not HAS_CURL_CFFI:
         raise RuntimeError("curl_cffi is required for generated image download")
     current = validate_generated_image_url(url)
+    _diagnostic_log("resolve_start " + _url_debug(current))
     _, max_redirects = _limits()
     redirects = mediators = 0
     source_is_mediator = False
 
     while True:
+        _diagnostic_log("resolve_request hop=%s mediator=%s %s" % (
+            redirects, source_is_mediator, _url_debug(current)))
         response = curl_requests.get(current, **_request_args(stream=True))
         try:
+            _diagnostic_log("resolve_response hop=%s %s %s" % (
+                redirects, _url_debug(current), _response_debug(response)))
             if response.status_code in _REDIRECT_STATUS:
                 if redirects >= max_redirects:
                     raise ValueError("generated image exceeded redirect limit")
@@ -279,6 +320,8 @@ def resolve_generated_image_url(url: str) -> str:
                 redirects += 1
                 continue
             if response.status_code != 200:
+                _diagnostic_log("resolve_failure reason=http_status %s %s" % (
+                    _url_debug(current), _response_debug(response)))
                 raise RuntimeError("generated image download failed: HTTP %s" % response.status_code)
             content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
             if content_type.startswith("image/"):
@@ -286,6 +329,8 @@ def resolve_generated_image_url(url: str) -> str:
                     raise ValueError("generated image mediator returned image bytes")
                 return current
             next_url = _read_mediator_url(response)
+            _diagnostic_log("resolve_mediator_body source=%s target=%s" % (
+                _url_debug(current), _url_debug(next_url)))
             mediators += 1
             if mediators > MAX_GENERATED_IMAGE_MEDIATORS:
                 raise ValueError("generated image exceeded mediator limit")
@@ -303,11 +348,15 @@ def resolve_generated_image_url(url: str) -> str:
 def download_generated_image(url: str) -> tuple[bytes, str]:
     """Download a resolved generated image with verified image bytes."""
     final_url = resolve_generated_image_url(url)
+    _diagnostic_log("download_resolved source=%s final=%s" % (_url_debug(url), _url_debug(final_url)))
     max_bytes, max_redirects = _limits()
     current = final_url
-    for _ in range(max_redirects + 1):
+    for hop in range(max_redirects + 1):
+        _diagnostic_log("download_request hop=%s %s" % (hop, _url_debug(current)))
         response = curl_requests.get(current, **_request_args(stream=True))
         try:
+            _diagnostic_log("download_response hop=%s %s %s" % (
+                hop, _url_debug(current), _response_debug(response)))
             if response.status_code in _REDIRECT_STATUS:
                 location = response.headers.get("Location")
                 if not location:
@@ -315,6 +364,8 @@ def download_generated_image(url: str) -> tuple[bytes, str]:
                 current = validate_generated_image_url(urljoin(current, location))
                 continue
             if response.status_code != 200:
+                _diagnostic_log("download_failure reason=http_status %s %s" % (
+                    _url_debug(current), _response_debug(response)))
                 raise RuntimeError("generated image download failed: HTTP %s" % response.status_code)
             content_length = response.headers.get("Content-Length")
             if content_length:
