@@ -636,7 +636,9 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(payload[0][3][1], "upstream prompt")
         self.assertEqual(payload[0][3][16], 0)
         self.assertIsNone(payload[0][3][20])
+        self.assertEqual(payload[0][3][9], "session-1")
         self.assertEqual(payload[1][4], "session-1")
+
 
     @mock.patch(
         "gemini_web2api.server.download_generated_image",
