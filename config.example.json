@@ -27,6 +27,8 @@
   "log_max_bytes": 2097152,
   "log_backup_count": 2,
   "temporary_chats": false,
+  "generated_image_max_bytes": 10485760,
+  "generated_image_max_redirects": 3,
   "session_hashes": {
     "gemini-3.1-pro": "从网页版请求头抓取的hash"
   }

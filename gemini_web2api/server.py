@@ -14,13 +14,66 @@ from socketserver import ThreadingMixIn
 
 from .config import CONFIG
 from .models import get_models, resolve_model
-from .gemini import GeminiUpstreamError, generate, generate_stream, log, _session_hash, safe_error_message
+from .gemini import (GeminiUpstreamError, generate, generate_stream, generate_image_structured,
+                     get_full_size_image, log, _session_hash, safe_error_message)
+from .generated_image import download_generated_image, resolve_generated_image_url
 from .tools import has_tool_call_marker, valid_tool_call_candidate, validate_tool_calls
 from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
 from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
 from .cache import CACHE
 from .rotation import rotation_worker_alive
 from . import __version__
+
+
+_CHAT_IMAGE_REQUEST = re.compile(
+    r"\b(?:generate|create|make|draw|render|paint)\s+"
+    r"(?:(?:me|us)\s+)?(?:(?:an?|the)\s+)?"
+    r"(?:image|picture|photo|illustration|artwork|icon|logo|portrait)\b",
+    re.IGNORECASE,
+)
+
+
+def _latest_user_text(messages) -> str:
+    if not isinstance(messages, list):
+        return ""
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content", "")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return " ".join(
+                part.get("text", "") for part in content
+                if isinstance(part, dict)
+                and part.get("type") in ("text", "input_text")
+                and isinstance(part.get("text"), str)
+            )
+        return ""
+    return ""
+
+
+def _chat_image_prompt(request: dict):
+    """Return an explicit image-generation prompt from the latest user turn."""
+    text = _latest_user_text(request.get("messages"))
+    modalities = request.get("modalities")
+    if (isinstance(modalities, list) and "image" in modalities) or _CHAT_IMAGE_REQUEST.search(text):
+        return text.strip() or None
+    return None
+
+
+def _generated_image_output(prompt: str, response_format: str):
+    result = generate_image_structured(prompt)
+    if not result.images:
+        raise RuntimeError("Gemini returned no generated image metadata")
+    source_url = get_full_size_image(result.images[0]) or result.images[0].url
+    if response_format == "url":
+        data = {"url": resolve_generated_image_url(source_url)}
+    else:
+        import base64
+        image_bytes, _mime = download_generated_image(source_url)
+        data = {"b64_json": base64.b64encode(image_bytes).decode("ascii")}
+    return result.text, data
 
 
 _agent_slot = threading.BoundedSemaphore(1)
@@ -433,6 +486,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self._handle_chat(body)
             elif self.path == "/v1/caches":
                 self._handle_cache_create(body)
+            elif self.path == "/v1/images/generations":
+                self._handle_image_generation(body)
             elif self.path == "/v1/responses":
                 self._handle_responses(body)
             elif ":streamGenerateContent" in self.path:
@@ -478,6 +533,51 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
         self.send_json({"object": "cache", **CACHE.create(messages, ttl)}, 201)
 
+    # ─── /v1/images/generations ───────────────────────────────────────────────
+
+    def _handle_image_generation(self, body: bytes):
+        req = self._parse_body(body)
+        if not isinstance(req, dict):
+            self.send_json({"error": {"message": "invalid JSON"}}, 400)
+            return
+        unsupported = [name for name in ("stream", "size", "quality", "style") if name in req]
+        unexpected = set(req) - {"prompt", "model", "n", "response_format"}
+        prompt = req.get("prompt")
+        if (unsupported or unexpected or not isinstance(prompt, str) or not prompt.strip()):
+            self.send_json({"error": {"message": "invalid image generation request"}}, 400)
+            return
+        if "n" in req and (not isinstance(req["n"], int) or isinstance(req["n"], bool) or req["n"] != 1):
+            self.send_json({"error": {"message": "only n=1 is supported"}}, 400)
+            return
+        response_format = req.get("response_format", "b64_json")
+        if response_format not in ("b64_json", "url"):
+            self.send_json({"error": {"message": "response_format must be b64_json or url"}}, 400)
+            return
+        model_value = req.get("model", CONFIG["default_model"])
+        if not isinstance(model_value, str):
+            self.send_json({"error": {"message": "invalid model"}}, 400)
+            return
+        _model_name, _model_id, _think_mode, err, _extra_fields = resolve_model(model_value)
+        if err:
+            self.send_json({"error": {"message": err}}, 400)
+            return
+        try:
+            result = generate_image_structured(prompt)
+            if not result.images:
+                raise RuntimeError("Gemini returned no generated image metadata")
+            source_url = get_full_size_image(result.images[0]) or result.images[0].url
+            if response_format == "url":
+                data = {"url": resolve_generated_image_url(source_url)}
+            else:
+                import base64
+                image_bytes, _mime = download_generated_image(source_url)
+                data = {"b64_json": base64.b64encode(image_bytes).decode("ascii")}
+        except Exception as e:
+            error = safe_error_message(e, 500)
+            self.send_json({"error": {"message": f"upstream error: {error}"}}, 502)
+            return
+        self.send_json({"created": int(time.time()), "data": [data]})
+
     # ─── /v1/chat/completions ─────────────────────────────────────────────────
 
     def _handle_chat(self, body: bytes):
@@ -515,6 +615,21 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         stream = req.get("stream", False)
+        image_prompt = _chat_image_prompt(req)
+        precomputed_text = None
+        if image_prompt:
+            try:
+                generated_text, image_data = _generated_image_output(image_prompt, "url")
+                image_markdown = f"![Generated image]({image_data['url']})"
+                precomputed_text = "\n\n".join(
+                    part for part in (generated_text, image_markdown) if part
+                )
+                tools = None
+                tool_choice = "none"
+                images = []
+            except Exception as e:
+                self.send_json({"error": {"message": f"upstream error: {safe_error_message(e, 500)}"}}, 502)
+                return
         tools_enabled = bool(tools) and tool_choice != "none"
         request_budget = max(1, int(CONFIG.get("agent_request_budget_sec", 300))) if tools_enabled else None
         request_attempts = 1 if tools_enabled else max(1, int(CONFIG.get("retry_attempts", 3)))
@@ -558,6 +673,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self._send_sse_keepalive_comment()
 
                 def upstream(notify):
+                    if precomputed_text is not None:
+                        yield precomputed_text
+                        return
                     yield from generate_stream(
                         prompt, model_id, think_mode, file_refs, extra_fields,
                         session_hash=_session_hash(model_name), request_id=cid,
@@ -626,6 +744,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         try:
             def operation(notify=None):
+                if precomputed_text is not None:
+                    return precomputed_text
                 return self._generate_buffered(
                     prompt, model_id, think_mode, file_refs, extra_fields,
                     model_name, cid, tools_enabled, on_first_response=notify,
@@ -747,7 +867,15 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         input_items = req.get("input", [])
-        tools = req.get("tools")
+        raw_tools = req.get("tools")
+        image_generation_requested = isinstance(raw_tools, list) and any(
+            isinstance(tool, dict) and tool.get("type") == "image_generation"
+            for tool in raw_tools
+        )
+        # Image generation is a native request signal, not an emulated function.
+        tools = ([tool for tool in raw_tools
+                  if isinstance(tool, dict) and tool.get("type") != "image_generation"]
+                 if isinstance(raw_tools, list) else raw_tools)
         messages = []
         if req.get("instructions"):
             messages.append({"role": "system", "content": req["instructions"]})
@@ -837,10 +965,36 @@ class GeminiHandler(BaseHTTPRequestHandler):
             f"budget_sec={request_budget if request_budget is not None else 'none'} "
             f"max_attempts={request_attempts}"
         )
+        if image_generation_requested and images:
+            self.send_json({
+                "error": {"message": "image generation with input images is not supported"}
+            }, 400)
+            return
+
+        generated_image_call = None
         try:
             file_refs = _upload_images(images)
-            operation = lambda: self._generate_buffered(prompt, model_id, think_mode, file_refs, extra_fields, model_name, rid, tools_enabled)
-            text = self._wait_with_heartbeat(operation) if req.get("stream") else operation()
+            if image_generation_requested:
+                import base64
+                result = generate_image_structured(prompt)
+                text = result.text
+                if not result.images:
+                    raise RuntimeError("Gemini returned no generated image metadata")
+                image_bytes, _mime = download_generated_image(
+                    get_full_size_image(result.images[0]) or result.images[0].url
+                )
+                generated_image_call = {
+                    "type": "image_generation_call",
+                    "id": f"imggen_{uuid.uuid4().hex[:12]}",
+                    "status": "completed",
+                    "result": base64.b64encode(image_bytes).decode("ascii"),
+                }
+            else:
+                operation = lambda: self._generate_buffered(
+                    prompt, model_id, think_mode, file_refs, extra_fields,
+                    model_name, rid, tools_enabled,
+                )
+                text = self._wait_with_heartbeat(operation) if req.get("stream") else operation()
         except Exception as e:
             error = safe_error_message(e, 500)
             status_code = 503 if isinstance(e, BlockingIOError) else 504 if isinstance(e, TimeoutError) else 502
@@ -890,9 +1044,11 @@ class GeminiHandler(BaseHTTPRequestHandler):
             for tc in tool_calls:
                 output.append({"type": "function_call", "id": tc["id"], "call_id": tc["id"],
                                "name": tc["function"]["name"], "arguments": tc["function"]["arguments"], "status": "completed"})
-        if text or not tool_calls:
+        if text or (not tool_calls and not generated_image_call):
             output.append({"type": "message", "id": mid, "role": "assistant", "status": "completed",
                            "content": [{"type": "output_text", "text": text or "", "annotations": []}]})
+        if generated_image_call:
+            output.append(generated_image_call)
 
         if req.get("stream"):
             self._start_sse()
@@ -966,6 +1122,17 @@ class GeminiHandler(BaseHTTPRequestHandler):
                         item_id=item["id"],
                         output_index=output_index,
                         arguments=item["arguments"],
+                    )
+                    emit(
+                        "response.output_item.done",
+                        output_index=output_index,
+                        item=item,
+                    )
+                elif item["type"] == "image_generation_call":
+                    emit(
+                        "response.output_item.added",
+                        output_index=output_index,
+                        item={"type": "image_generation_call", "id": item["id"], "status": "in_progress"},
                     )
                     emit(
                         "response.output_item.done",

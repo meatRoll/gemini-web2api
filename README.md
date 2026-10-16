@@ -432,6 +432,20 @@ resp = client.chat.completions.create(
 )
 ```
 
+## Image Output
+
+The modular server supports `POST /v1/images/generations` with `prompt`, `n: 1`, and
+`response_format` set to `b64_json` or `url`. The image route uses Gemini Web's dedicated
+browser request shape and returns one OpenAI-compatible image result. `stream`, `size`,
+`quality`, `style`, image editing, and multiple outputs are not supported.
+
+The Responses API also accepts `{"type": "image_generation"}` in `tools` and returns an
+`image_generation_call` containing base64 output. Chat Completions recognizes explicit
+requests such as `generate an image of ...` and returns a Markdown image URL.
+
+Generated image URLs are restricted to validated Google image hosts, with bounded redirects,
+size limits, and image signature checks.
+
 ## Limitations
 
 - **Image input requires authentication and Chrome transport**: Use the modular server with a valid cookie and `curl_cffi`. Serv00/FreeBSD can use the [native image-input release](deploy/serv00/README.md) with bundled runtime wheels, without Docker.

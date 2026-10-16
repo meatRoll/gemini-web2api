@@ -594,7 +594,39 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(_classify_response_quality("", 'Quoted: I seem to be encountering an error.', True), "normal")
         self.assertEqual(_classify_response_quality("", "I couldn't do that because it is unsafe.", True), "normal")
 
-    def test_root_health_reports_dead_rotation_worker(self):
+    @mock.patch("gemini_web2api.server.download_generated_image", return_value=(b"\x89PNG\r\n\x1a\n", "image/png"))
+    @mock.patch("gemini_web2api.server.get_full_size_image", return_value=None)
+    @mock.patch("gemini_web2api.server.generate_image_structured")
+    def test_image_generation_endpoint_returns_b64_json(self, generate_image_structured, _full_size, _download):
+        from gemini_web2api.generated_image import GeneratedImage, GenerationResult
+        generate_image_structured.return_value = GenerationResult(
+            images=[GeneratedImage("https://lh3.googleusercontent.com/generated")]
+        )
+        status, _, body = self.post_json("/v1/images/generations", {
+            "prompt": "a red fox", "response_format": "b64_json",
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["data"][0]["b64_json"], "iVBORw0KGgo=")
+        generate_image_structured.assert_called_once_with("a red fox")
+
+    @mock.patch("gemini_web2api.server.download_generated_image", return_value=(b"\x89PNG\r\n\x1a\n", "image/png"))
+    @mock.patch("gemini_web2api.server.get_full_size_image", return_value=None)
+    @mock.patch("gemini_web2api.server.generate_image_structured")
+    def test_responses_image_generation_returns_native_output(self, generate_image_structured, _full_size, _download):
+        from gemini_web2api.generated_image import GeneratedImage, GenerationResult
+        generate_image_structured.return_value = GenerationResult(
+            images=[GeneratedImage("https://lh3.googleusercontent.com/generated")]
+        )
+        status, _, body = self.post_json("/v1/responses", {
+            "input": "make a red fox",
+            "tools": [{"type": "image_generation"}],
+        })
+        self.assertEqual(status, 200)
+        response = json.loads(body)
+        self.assertEqual(response["output"][0]["type"], "image_generation_call")
+        self.assertEqual(response["output"][0]["result"], "iVBORw0KGgo=")
+
+
         with mock.patch("gemini_web2api.server.rotation_worker_alive", return_value=False):
             connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
             connection.request("GET", "/")

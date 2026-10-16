@@ -1,4 +1,5 @@
 """Gemini StreamGenerate protocol implementation with httpx streaming."""
+from __future__ import annotations
 import json
 import time
 import uuid
@@ -10,6 +11,7 @@ import os
 import hashlib
 import threading
 import random
+import secrets
 
 try:
     import httpx
@@ -25,6 +27,7 @@ except ImportError:
     HAS_CURL_CFFI = False
 
 from .config import CONFIG
+from .generated_image import GenerationResult, extract_generation_result
 from .tools import has_tool_call_marker, valid_tool_call_candidate
 
 _ssl_ctx = None
@@ -170,6 +173,38 @@ def _account_prefix() -> str:
     return f"/u/{auth_user}"
 
 
+_IMAGE_MODEL_HEADER_KEY = "x-goog-ext-525001261-jspb"
+_IMAGE_MODEL_FALLBACK = ("8c46e95b1a07cecc", "2", 6)
+
+
+def build_model_header(model_id: str, capacity_tail: str | int, model_category: int) -> dict:
+    """Build the Gemini Web model-selection headers for image generation."""
+    return {
+        _IMAGE_MODEL_HEADER_KEY: (
+            f'[1,null,null,null,"{model_id}",null,null,0,[4,5,6,8],null,null,'
+            f'{capacity_tail},null,null,{model_category}]'
+        ),
+        "x-goog-ext-73010989-jspb": "[0]",
+        "x-goog-ext-73010990-jspb": "[0,0,0]",
+    }
+
+
+def _image_model_headers(page_tokens: dict, session_uuid: str = None) -> dict:
+    """Use a discovered image route when available, with a bounded fallback."""
+    discovered = page_tokens.get("image_model")
+    if (isinstance(discovered, (tuple, list)) and len(discovered) == 3
+            and re.fullmatch(r"[a-f0-9]{16}", str(discovered[0]))
+            and str(discovered[1]).isdigit() and str(discovered[2]) == "6"):
+        model_id, capacity_tail, category = discovered
+    else:
+        model_id, capacity_tail, category = _IMAGE_MODEL_FALLBACK
+    headers = build_model_header(str(model_id), str(capacity_tail), int(category))
+    model_header = json.loads(headers[_IMAGE_MODEL_HEADER_KEY])
+    model_header.extend([1, session_uuid or str(uuid.uuid4()).upper()])
+    headers[_IMAGE_MODEL_HEADER_KEY] = json.dumps(model_header)
+    return headers
+
+
 def _build_headers(session_hash=None, request_uuid=None) -> dict:
     cookie_str, sapisid = load_cookie()
     account_prefix = _account_prefix()
@@ -266,6 +301,38 @@ def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list 
                 inner[k] = v
     outer = [None, json.dumps(inner)]
     params = {"f.req": json.dumps(outer)}
+    if xsrf_token or CONFIG.get("xsrf_token"):
+        params["at"] = xsrf_token or CONFIG["xsrf_token"]
+    return urllib.parse.urlencode(params)
+
+
+def _build_image_payload(prompt: str, request_uuid: str, xsrf_token: str = None) -> str:
+    """Build the dedicated Gemini Web image-generation request body."""
+    inner = [None] * 97
+    inner[0] = [prompt, 0, None, None, None, None, 0]
+    inner[1] = ["en"]
+    inner[2] = ["", "", "", None, None, None, None, None, None, ""]
+    inner[3] = "!" + secrets.token_urlsafe(1903)
+    inner[4] = uuid.uuid4().hex
+    inner[6] = [0]
+    inner[7] = 1
+    inner[10] = 1
+    inner[11] = 0
+    inner[17] = [[0]]
+    inner[18] = 0
+    inner[27] = 1
+    inner[30] = [4]
+    inner[41] = [1]
+    inner[53] = 0
+    inner[59] = request_uuid
+    inner[61] = []
+    inner[67] = 0
+    inner[68] = 1
+    inner[79] = 6
+    inner[80] = 1
+    inner[91] = 0
+    inner[96] = 0
+    params = {"f.req": json.dumps([None, json.dumps(inner)])}
     if xsrf_token or CONFIG.get("xsrf_token"):
         params["at"] = xsrf_token or CONFIG["xsrf_token"]
     return urllib.parse.urlencode(params)
@@ -441,6 +508,122 @@ def extract_response_text(raw: str) -> str:
     return clean_text(selected)
 
 
+def _generate_image_raw_with_curl(prompt: str) -> str:
+    """Send the dedicated GUI-equivalent image-generation request via Chrome TLS."""
+    if not HAS_CURL_CFFI:
+        raise RuntimeError("curl_cffi is required for Gemini image generation")
+
+    from .multimodal import _cached_page_tokens
+    page_tokens = _cached_page_tokens(max_age=0)
+    request_uuid = str(uuid.uuid4()).upper()
+    body = _build_image_payload(prompt, request_uuid, xsrf_token=page_tokens.get("at"))
+    headers = _build_headers(request_uuid)
+    headers.update(_image_model_headers(page_tokens, str(uuid.uuid4()).upper()))
+    request_args = {
+        "data": body,
+        "headers": headers,
+        "timeout": CONFIG["request_timeout_sec"],
+        "impersonate": "chrome",
+    }
+    if CONFIG.get("proxy"):
+        request_args["proxy"] = CONFIG["proxy"]
+
+    last_err = None
+    for attempt in range(max(1, CONFIG["retry_attempts"])):
+        try:
+            response = curl_requests.post(_get_url(page_tokens.get("f_sid")), **request_args)
+            response.raise_for_status()
+            return response.text
+        except Exception as exc:
+            last_err = exc
+            if attempt < max(1, CONFIG["retry_attempts"]) - 1:
+                log(f"Image generation retry {attempt + 1}/{CONFIG['retry_attempts']}: {exc}")
+                time.sleep(_retry_delay(attempt))
+    raise last_err
+
+
+def generate_image_structured(prompt: str) -> GenerationResult:
+    """Generate an image with the GUI-specific payload and return rich metadata."""
+    return extract_generation_result(_generate_image_raw_with_curl(prompt), clean_text)
+
+
+def _batch_response_url(raw: str) -> str:
+    """Extract the first full-size image URL from batchexecute's framed RPC body."""
+    decoder = json.JSONDecoder()
+    position = raw.find("\n") + 1 if raw.startswith(")]}'") else 0
+    while position < len(raw):
+        while position < len(raw) and raw[position].isspace():
+            position += 1
+        length = re.match(r"\d+\n", raw[position:])
+        if not length:
+            break
+        position += length.end()
+        try:
+            envelope, position = decoder.raw_decode(raw, position)
+        except json.JSONDecodeError:
+            break
+        pending = [envelope]
+        while pending:
+            record = pending.pop()
+            if not isinstance(record, list):
+                continue
+            if (len(record) >= 3 and record[0] == "wrb.fr" and record[1] == "c8o8Fe"
+                    and isinstance(record[2], str)):
+                try:
+                    payload = json.loads(record[2])
+                    candidate = payload[0] if isinstance(payload, list) and payload else None
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if isinstance(candidate, str):
+                    return candidate
+            pending.extend(item for item in record if isinstance(item, list))
+    raise ValueError("full-size image RPC returned no URL")
+
+
+def get_full_size_image(image) -> str | None:
+    """Ask Gemini's c8o8Fe RPC for a full-size generated-image URL."""
+    if not HAS_CURL_CFFI or not all(isinstance(value, str) and value for value in
+                                    (image.cid, image.rid, image.rcid, image.image_id)):
+        return None
+    try:
+        from .multimodal import _cached_page_tokens
+        page_tokens = _cached_page_tokens(max_age=0)
+        payload = [
+            [[None, None, None, [None, None, None, None, None, ""]], [image.image_id, 0],
+             None, [19, ""], None, None, None, None, None, ""],
+            [image.rid, image.rcid, image.cid, None, ""], 1, 0, 1,
+        ]
+        rpc = ["c8o8Fe", json.dumps(payload), None, "generic"]
+        params = {
+            "rpcids": "c8o8Fe", "hl": "en", "_reqid": int(time.time()) % 1000000,
+            "rt": "c", "source-path": f"{_account_prefix()}/app/{image.cid}",
+            "bl": CONFIG["gemini_bl"],
+        }
+        if page_tokens.get("f_sid"):
+            params["f.sid"] = page_tokens["f_sid"]
+        body = urllib.parse.urlencode({
+            "f.req": json.dumps([[rpc]]),
+            "at": page_tokens.get("at") or CONFIG.get("xsrf_token") or "",
+        })
+        headers = _build_headers(str(uuid.uuid4()).upper())
+        headers.update(_image_model_headers(page_tokens))
+        args = {"data": body, "headers": headers,
+                "timeout": CONFIG["request_timeout_sec"], "impersonate": "chrome"}
+        if CONFIG.get("proxy"):
+            args["proxy"] = CONFIG["proxy"]
+        url = (f"https://gemini.google.com{_account_prefix()}/_/BardChatUi/data/"
+               f"batchexecute?{urllib.parse.urlencode(params)}")
+        response = curl_requests.post(url, **args)
+        try:
+            response.raise_for_status()
+            return _batch_response_url(response.text)
+        finally:
+            close = getattr(response, "close", None)
+            if close:
+                close()
+    except Exception as exc:
+        log(f"Full-size image RPC unavailable: {safe_error_message(exc)}")
+        return None
 
 def _generate_file_with_curl(prompt, model_id, think_mode, file_refs, extra_fields=None,
                              session_hash=None, request_id=None, *, budget_sec=None,
