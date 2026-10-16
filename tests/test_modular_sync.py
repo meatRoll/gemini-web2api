@@ -594,6 +594,29 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(_classify_response_quality("", 'Quoted: I seem to be encountering an error.', True), "normal")
         self.assertEqual(_classify_response_quality("", "I couldn't do that because it is unsafe.", True), "normal")
 
+    def test_full_size_rpc_payload_uses_generated_image_context(self):
+        from gemini_web2api.generated_image import GeneratedImage
+        context = [None] * 23
+        context[0] = 22
+        image = GeneratedImage(
+            "https://lh3.googleusercontent.com/generated",
+            image_id="http://googleusercontent.com/image_generation_content/0_799",
+            cid="c_1", rid="r_1", rcid="rc_1",
+            rpc_payload={
+                "signature": "image-signature",
+                "context": context,
+                "prompt": "a red circle",
+                "session_id": "session-1",
+            },
+        )
+        payload = gemini._build_full_size_rpc_payload(image)
+        self.assertEqual(payload[0][0][3][5], "image-signature")
+        self.assertEqual(payload[0][1], [image.image_id, 0])
+        self.assertEqual(payload[0][3][1], "a red circle")
+        self.assertEqual(payload[0][3][16], 0)
+        self.assertIsNone(payload[0][3][20])
+        self.assertEqual(payload[1][4], "session-1")
+
     @mock.patch(
         "gemini_web2api.server.download_generated_image",
         side_effect=[RuntimeError("generated image download failed: HTTP 403"), (b"\x89PNG\r\n\x1a\n", "image/png")],
