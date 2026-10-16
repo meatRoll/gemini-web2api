@@ -7,7 +7,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 try:
     from curl_cffi import requests as curl_requests
@@ -23,7 +23,10 @@ MAX_GENERATED_IMAGE_REDIRECTS = 3
 MAX_GENERATED_IMAGE_MEDIATORS = 2
 MAX_GENERATED_IMAGE_URL_TEXT_BYTES = 8192
 _ALLOWED_GENERATED_IMAGE_HOST = "googleusercontent.com"
-_MEDIATOR_GENERATED_IMAGE_HOST = "work.fife.usercontent.google.com"
+_MEDIATOR_GENERATED_IMAGE_HOSTS = {
+    "lh3.google.com",
+    "work.fife.usercontent.google.com",
+}
 _REDIRECT_STATUS = {301, 302, 303, 307, 308}
 _MAGIC_MIMES = (
     (b"\x89PNG\r\n\x1a\n", "image/png"),
@@ -46,8 +49,9 @@ def _url_debug(url: str) -> str:
     try:
         parsed = urlsplit(url)
         query_keys = sorted({part.split("=", 1)[0] for part in parsed.query.split("&") if part})
-        return "host=%s path=%s query_keys=%s url_sha256=%s" % (
-            parsed.hostname or "", parsed.path or "/", ",".join(query_keys) or "-",
+        return "host=%s path_sha256=%s path_len=%s query_keys=%s url_sha256=%s" % (
+            parsed.hostname or "", hashlib.sha256((parsed.path or "/").encode("utf-8")).hexdigest()[:12],
+            len(parsed.path or "/"), ",".join(query_keys) or "-",
             hashlib.sha256(url.encode("utf-8")).hexdigest()[:12],
         )
     except Exception:
@@ -140,7 +144,13 @@ def extract_generation_result(raw: str, clean_text) -> GenerationResult:
         if isinstance(metadata, list):
             cid = _nested(metadata, [0], cid) or cid
             rid = _nested(metadata, [1], rid) or rid
+        cid = _nested(frame, [0, 0, 0, 0], cid) or cid
+        rid = _nested(frame, [0, 0, 0, 1], rid) or rid
         candidates = _nested(frame, [4], [])
+        if not isinstance(candidates, list) or not candidates:
+            # Newer Gemini Web responses place candidates under the hNvQHb-style
+            # envelope used by the HAR capture: frame[0][0][3][0].
+            candidates = _nested(frame, [0, 0, 3, 0], [])
         if not isinstance(candidates, list):
             continue
         for candidate in candidates:
@@ -156,22 +166,38 @@ def extract_generation_result(raw: str, clean_text) -> GenerationResult:
             if not isinstance(entries, list):
                 continue
             for entry in entries:
-                url = _nested(entry, [0, 3, 3], "")
-                if not isinstance(url, str) or not url:
-                    continue
-                image_id = _nested(entry, [1, 0], "")
-                key = (url, image_id)
-                if key in seen:
-                    continue
-                seen.add(key)
-                alt = _nested(entry, [0, 3, 2], "")
-                images.append(GeneratedImage(
-                    url=url, alt=alt if isinstance(alt, str) else "",
-                    image_id=image_id if isinstance(image_id, str) else "",
-                    cid=cid if isinstance(cid, str) else "",
-                    rid=rid if isinstance(rid, str) else "",
-                    rcid=rcid if isinstance(rcid, str) else "",
-                ))
+                nested_entries = [
+                    item for item in entry if isinstance(item, list)
+                    and isinstance(_nested(item, [3, 3], ""), str)
+                    and _nested(item, [3, 3], "")
+                ] if isinstance(entry, list) else []
+                image_entries = nested_entries or [entry]
+                content_refs = _nested(entry, [1], []) if nested_entries else []
+                for image_index, image_entry in enumerate(image_entries):
+                    url = _nested(image_entry, [0, 3, 3], "")
+                    if not isinstance(url, str) or not url:
+                        url = _nested(image_entry, [3, 3], "")
+                    if not isinstance(url, str) or not url:
+                        continue
+                    image_id = _nested(entry, [1, 0], "")
+                    if nested_entries:
+                        image_id = _nested(content_refs, [image_index], image_id)
+                    if not isinstance(image_id, str) or not image_id:
+                        image_id = f"http://googleusercontent.com/image_generation_content/{image_index}"
+                    key = (url, image_id)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    alt = _nested(image_entry, [0, 3, 2], "")
+                    if not isinstance(alt, str) or not alt:
+                        alt = _nested(image_entry, [3, 2], "")
+                    images.append(GeneratedImage(
+                        url=url, alt=alt if isinstance(alt, str) else "",
+                        image_id=image_id,
+                        cid=cid if isinstance(cid, str) else "",
+                        rid=rid if isinstance(rid, str) else "",
+                        rcid=rcid if isinstance(rcid, str) else "",
+                    ))
     return GenerationResult(text=clean_text(text), images=images, raw=raw)
 
 
@@ -212,7 +238,25 @@ def validate_generated_image_url(url: str) -> str:
 
 
 def _validate_mediator_url(url: str) -> str:
-    return _validated_https_url(url, {_MEDIATOR_GENERATED_IMAGE_HOST})
+    return _validated_https_url(url, _MEDIATOR_GENERATED_IMAGE_HOSTS)
+
+
+def _with_alr(url: str) -> str:
+    """Match Gemini Web's image-loader flag on every generated-image hop."""
+    parsed = urlsplit(url)
+    query = parse_qsl(parsed.query, keep_blank_values=True)
+    if not any(key == "alr" for key, _value in query):
+        query.append(("alr", "yes"))
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment))
+
+
+def _classify_image_url(url: str) -> tuple[str, bool]:
+    """Validate a hop and report whether it is a text mediator."""
+    url = _with_alr(url)
+    try:
+        return validate_generated_image_url(url), False
+    except ValueError:
+        return _validate_mediator_url(url), True
 
 
 def _image_mime(data: bytes) -> str:
@@ -238,7 +282,11 @@ def _limits() -> tuple[int, int]:
 
 def _request_args(stream: bool) -> dict:
     args = {
-        "headers": {"Referer": "https://gemini.google.com/"},
+        "headers": {
+            "Accept": "*/*",
+            "Origin": "https://gemini.google.com",
+            "Referer": "https://gemini.google.com/",
+        },
         "timeout": CONFIG["request_timeout_sec"],
         "impersonate": "chrome",
         "allow_redirects": False,
@@ -281,21 +329,21 @@ def _read_mediator_url(response) -> str:
 def resolve_generated_image_url(url: str) -> str:
     """Resolve Gemini's bounded text mediators to a final image URL.
 
-    The only non-googleusercontent hop is the exact ``work.fife`` host, which
-    is accepted solely when it returns one small text/plain HTTPS URL.  This is
-    used by ``response_format=url`` without downloading the final image bytes.
+    Gemini Web adds ``alr=yes`` and follows up to two text/plain hops before
+    fetching the final image.  The current flow uses ``lh3.google.com``;
+    older responses can use the exact ``work.fife`` mediator host.
     """
     if not HAS_CURL_CFFI:
         raise RuntimeError("curl_cffi is required for generated image download")
-    current = validate_generated_image_url(url)
+    current = _with_alr(validate_generated_image_url(url))
     _diagnostic_log("resolve_start " + _url_debug(current))
     _, max_redirects = _limits()
     redirects = mediators = 0
-    source_is_mediator = False
+    current_is_mediator = False
 
     while True:
         _diagnostic_log("resolve_request hop=%s mediator=%s %s" % (
-            redirects, source_is_mediator, _url_debug(current)))
+            redirects, current_is_mediator, _url_debug(current)))
         response = curl_requests.get(current, **_request_args(stream=True))
         try:
             _diagnostic_log("resolve_response hop=%s %s %s" % (
@@ -306,17 +354,7 @@ def resolve_generated_image_url(url: str) -> str:
                 location = response.headers.get("Location")
                 if not location:
                     raise ValueError("generated image redirect has no location")
-                next_url = urljoin(current, location)
-                # A work.fife URL is permitted only as the first text mediator;
-                # redirect responses may otherwise remain on Google hosts.
-                try:
-                    current = validate_generated_image_url(next_url)
-                    source_is_mediator = False
-                except ValueError:
-                    if source_is_mediator:
-                        raise
-                    current = _validate_mediator_url(next_url)
-                    source_is_mediator = True
+                current, current_is_mediator = _classify_image_url(urljoin(current, location))
                 redirects += 1
                 continue
             if response.status_code != 200:
@@ -325,20 +363,16 @@ def resolve_generated_image_url(url: str) -> str:
                 raise RuntimeError("generated image download failed: HTTP %s" % response.status_code)
             content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
             if content_type.startswith("image/"):
-                if source_is_mediator:
+                if current_is_mediator:
                     raise ValueError("generated image mediator returned image bytes")
                 return current
-            next_url = _read_mediator_url(response)
+            next_url = _with_alr(_read_mediator_url(response))
             _diagnostic_log("resolve_mediator_body source=%s target=%s" % (
                 _url_debug(current), _url_debug(next_url)))
             mediators += 1
             if mediators > MAX_GENERATED_IMAGE_MEDIATORS:
                 raise ValueError("generated image exceeded mediator limit")
-            if source_is_mediator:
-                # The second stage must lead back to an allowlisted final image host.
-                return validate_generated_image_url(next_url)
-            current = _validate_mediator_url(next_url)
-            source_is_mediator = True
+            current, current_is_mediator = _classify_image_url(next_url)
         finally:
             close = getattr(response, "close", None)
             if close:
@@ -361,7 +395,7 @@ def download_generated_image(url: str) -> tuple[bytes, str]:
                 location = response.headers.get("Location")
                 if not location:
                     raise ValueError("generated image redirect has no location")
-                current = validate_generated_image_url(urljoin(current, location))
+                current = _with_alr(validate_generated_image_url(urljoin(current, location)))
                 continue
             if response.status_code != 200:
                 _diagnostic_log("download_failure reason=http_status %s %s" % (
