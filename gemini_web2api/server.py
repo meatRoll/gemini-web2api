@@ -63,20 +63,43 @@ def _chat_image_prompt(request: dict):
     return None
 
 
+def _generated_image_payload(image, response_format: str):
+    """Resolve an image, falling back to the preview URL if full-size delivery fails."""
+    full_size_url = get_full_size_image(image)
+    candidates = []
+    if full_size_url:
+        candidates.append(("full_size", full_size_url))
+    if isinstance(image.url, str) and image.url and image.url != full_size_url:
+        candidates.append(("preview", image.url))
+    if not candidates:
+        raise RuntimeError("Gemini returned no usable generated image URL")
+
+    last_error = None
+    for index, (source_kind, source_url) in enumerate(candidates):
+        try:
+            if response_format == "url":
+                data = {"url": resolve_generated_image_url(source_url)}
+            else:
+                import base64
+                image_bytes, _mime = download_generated_image(source_url)
+                data = {"b64_json": base64.b64encode(image_bytes).decode("ascii")}
+            return data, source_kind, source_url
+        except Exception as exc:
+            last_error = exc
+            if index + 1 < len(candidates):
+                log("image_generation_fallback from=%s to=%s error_type=%s" % (
+                    source_kind, candidates[index + 1][0], type(exc).__name__))
+    raise last_error
+
+
 def _generated_image_output(prompt: str, response_format: str):
     result = generate_image_structured(prompt)
     if not result.images:
         raise RuntimeError("Gemini returned no generated image metadata")
-    source_url = get_full_size_image(result.images[0]) or result.images[0].url
+    data, source_kind, source_url = _generated_image_payload(result.images[0], response_format)
     log("image_generation_result images=%s selected_full_size=%s response_format=%s source_host=%s source_path=%s" % (
-        len(result.images), bool(result.images[0].cid and result.images[0].rid and result.images[0].rcid and result.images[0].image_id),
-        response_format, (urlsplit(source_url).hostname or "-"), (urlsplit(source_url).path or "/")))
-    if response_format == "url":
-        data = {"url": resolve_generated_image_url(source_url)}
-    else:
-        import base64
-        image_bytes, _mime = download_generated_image(source_url)
-        data = {"b64_json": base64.b64encode(image_bytes).decode("ascii")}
+        len(result.images), source_kind == "full_size", response_format,
+        (urlsplit(source_url).hostname or "-"), (urlsplit(source_url).path or "/")))
     return result.text, data
 
 
@@ -581,13 +604,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             result = generate_image_structured(prompt)
             if not result.images:
                 raise RuntimeError("Gemini returned no generated image metadata")
-            source_url = get_full_size_image(result.images[0]) or result.images[0].url
-            if response_format == "url":
-                data = {"url": resolve_generated_image_url(source_url)}
-            else:
-                import base64
-                image_bytes, _mime = download_generated_image(source_url)
-                data = {"b64_json": base64.b64encode(image_bytes).decode("ascii")}
+            data, _source_kind, _source_url = _generated_image_payload(result.images[0], response_format)
         except Exception as e:
             error = safe_error_message(e, 500)
             self.send_json({"error": {"message": f"upstream error: {error}"}}, 502)
@@ -991,19 +1008,16 @@ class GeminiHandler(BaseHTTPRequestHandler):
         try:
             file_refs = _upload_images(images)
             if image_generation_requested:
-                import base64
                 result = generate_image_structured(prompt)
                 text = result.text
                 if not result.images:
                     raise RuntimeError("Gemini returned no generated image metadata")
-                image_bytes, _mime = download_generated_image(
-                    get_full_size_image(result.images[0]) or result.images[0].url
-                )
+                image_data, _source_kind, _source_url = _generated_image_payload(result.images[0], "b64_json")
                 generated_image_call = {
                     "type": "image_generation_call",
                     "id": f"imggen_{uuid.uuid4().hex[:12]}",
                     "status": "completed",
-                    "result": base64.b64encode(image_bytes).decode("ascii"),
+                    "result": image_data["b64_json"],
                 }
             else:
                 operation = lambda: self._generate_buffered(

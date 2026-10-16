@@ -594,10 +594,15 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(_classify_response_quality("", 'Quoted: I seem to be encountering an error.', True), "normal")
         self.assertEqual(_classify_response_quality("", "I couldn't do that because it is unsafe.", True), "normal")
 
-    @mock.patch("gemini_web2api.server.download_generated_image", return_value=(b"\x89PNG\r\n\x1a\n", "image/png"))
-    @mock.patch("gemini_web2api.server.get_full_size_image", return_value=None)
+    @mock.patch(
+        "gemini_web2api.server.download_generated_image",
+        side_effect=[RuntimeError("generated image download failed: HTTP 403"), (b"\x89PNG\r\n\x1a\n", "image/png")],
+    )
+    @mock.patch("gemini_web2api.server.get_full_size_image", return_value="https://lh3.googleusercontent.com/full")
     @mock.patch("gemini_web2api.server.generate_image_structured")
-    def test_image_generation_endpoint_returns_b64_json(self, generate_image_structured, _full_size, _download):
+    def test_image_generation_endpoint_falls_back_to_preview_on_full_size_failure(
+        self, generate_image_structured, _full_size, download_generated_image
+    ):
         from gemini_web2api.generated_image import GeneratedImage, GenerationResult
         generate_image_structured.return_value = GenerationResult(
             images=[GeneratedImage("https://lh3.googleusercontent.com/generated")]
@@ -607,7 +612,10 @@ class StreamingEndpointTests(unittest.TestCase):
             "size": "1024x1024", "quality": "high", "background": "opaque",
         })
         self.assertEqual(status, 200)
-        self.assertEqual(json.loads(body)["data"][0]["b64_json"], "iVBORw0KGgo=")
+        self.assertEqual(download_generated_image.call_args_list, [
+            mock.call("https://lh3.googleusercontent.com/full"),
+            mock.call("https://lh3.googleusercontent.com/generated"),
+        ])
         generate_image_structured.assert_called_once_with("a red fox")
 
     @mock.patch("gemini_web2api.server.download_generated_image", return_value=(b"\x89PNG\r\n\x1a\n", "image/png"))
