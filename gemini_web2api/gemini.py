@@ -604,12 +604,6 @@ def _build_full_size_rpc_payload(image) -> list:
         context = rpc_info.get("context")
         if isinstance(signature, str) and signature and isinstance(context, list):
             context = list(context)
-            if len(context) > 1:
-                context[1] = rpc_info.get("prompt", "")
-            if len(context) > 16:
-                context[16] = 0
-            if len(context) > 20:
-                context[20] = None
             session_id = rpc_info.get("session_id")
             if not isinstance(session_id, str) or not session_id:
                 alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
