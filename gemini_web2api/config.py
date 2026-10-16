@@ -31,6 +31,8 @@ DEFAULT_CONFIG = {
     "auto_cache": True,
     "api_keys": [],
     "temporary_chats": False,
+    "generated_image_max_bytes": 10 * 1024 * 1024,
+    "generated_image_max_redirects": 3,
     "session_hashes": {},
 }
 
