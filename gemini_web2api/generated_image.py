@@ -34,6 +34,25 @@ _MAGIC_MIMES = (
 )
 
 
+def _generated_image_id(rcid: str, variant: int, image_index: int) -> str:
+    """Reproduce Gemini Web's fallback IMAGE_ID hash for c8o8Fe."""
+    value = f"{rcid}_{variant}_{image_index}".encode("utf-16-le")
+    hash_value = 0
+    for offset in range(0, len(value), 2):
+        code_unit = value[offset] | (value[offset + 1] << 8)
+        hash_value = ((hash_value << 5) - hash_value + code_unit) & 0xFFFFFFFF
+        if hash_value >= 0x80000000:
+            hash_value -= 0x100000000
+    number = abs(hash_value)
+    alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
+    encoded = "0" if number == 0 else ""
+    while number:
+        number, remainder = divmod(number, 36)
+        encoded = alphabet[remainder] + encoded
+    encoded = encoded[-12:]
+    return (encoded * 8)[:16]
+
+
 def _diagnostic_log(message: str) -> None:
     """Write image-download diagnostics through the service logger."""
     try:
@@ -209,7 +228,13 @@ def extract_generation_result(raw: str, clean_text) -> GenerationResult:
                         url = _nested(image_entry, [3, 3], "")
                     if not isinstance(url, str) or not url:
                         continue
+                    variant = _nested(entry, [1, 1], 0)
+                    if not isinstance(variant, int) or isinstance(variant, bool):
+                        variant = 0
                     image_id = _nested(rpc_entry, [9], "") if isinstance(rpc_entry, list) else ""
+                    if not isinstance(image_id, str) or not image_id:
+                        image_id = (_generated_image_id(rcid, variant, image_index)
+                                    if isinstance(rcid, str) and rcid else "")
                     if not isinstance(image_id, str) or not image_id:
                         image_id = _nested(entry, [1, 0], "")
                     if nested_entries and (not isinstance(image_id, str) or not image_id):
