@@ -209,8 +209,10 @@ def extract_generation_result(raw: str, clean_text) -> GenerationResult:
                         url = _nested(image_entry, [3, 3], "")
                     if not isinstance(url, str) or not url:
                         continue
-                    image_id = _nested(entry, [1, 0], "")
-                    if nested_entries:
+                    image_id = _nested(rpc_entry, [9], "") if isinstance(rpc_entry, list) else ""
+                    if not isinstance(image_id, str) or not image_id:
+                        image_id = _nested(entry, [1, 0], "")
+                    if nested_entries and (not isinstance(image_id, str) or not image_id):
                         image_id = _nested(content_refs, [image_index], image_id)
                     if not isinstance(image_id, str) or not image_id:
                         image_id = f"http://googleusercontent.com/image_generation_content/{image_index}"
