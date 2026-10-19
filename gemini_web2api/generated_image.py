@@ -374,6 +374,17 @@ def _limits() -> tuple[int, int]:
 
 
 def _request_args(stream: bool) -> dict:
+    browser_headers = {
+        "x-browser-channel": "stable",
+        "x-browser-copyright": "Copyright 2026 Google LLC. All Rights Reserved.",
+        "x-browser-validation": "YXjt/if5gRhK4M5qXvb22nUeBck=",
+        "x-browser-year": "2026",
+        "x-client-data": "CKmdygEIlaHLAQiGoM0B",
+    }
+    configured = CONFIG.get("google_browser_headers")
+    if isinstance(configured, dict):
+        browser_headers.update({key: value for key, value in configured.items()
+                                if key in browser_headers and isinstance(value, str) and value})
     args = {
         "headers": {
             "Accept": "*/*",
@@ -385,6 +396,7 @@ def _request_args(stream: bool) -> dict:
             "Sec-Fetch-Dest": "empty",
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Site": "cross-site",
+            **browser_headers,
         },
         "timeout": CONFIG["request_timeout_sec"],
         "impersonate": "chrome",

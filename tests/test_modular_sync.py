@@ -613,6 +613,24 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(header[17], [CONFIG["gemini_bl"]])
         self.assertEqual(headers["x-goog-ext-73010989-jspb"], "[0]")
 
+    def test_gemini_browser_identity_headers_match_har(self):
+        expected = {
+            "x-browser-channel": "stable",
+            "x-browser-copyright": "Copyright 2026 Google LLC. All Rights Reserved.",
+            "x-browser-validation": "YXjt/if5gRhK4M5qXvb22nUeBck=",
+            "x-browser-year": "2026",
+            "x-client-data": "CKmdygEIlaHLAQiGoM0B",
+        }
+        self.assertEqual(
+            {key: gemini._build_headers()[key] for key in expected}, expected
+        )
+        from gemini_web2api.generated_image import _request_args
+        self.assertEqual(
+            {key.lower(): value for key, value in _request_args(stream=True)["headers"].items()
+             if key.lower() in expected},
+            expected,
+        )
+
     def test_generated_image_id_matches_gemini_web_fallback(self):
         from gemini_web2api.generated_image import _generated_image_id
         self.assertEqual(

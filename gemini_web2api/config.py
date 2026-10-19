@@ -12,6 +12,13 @@ DEFAULT_CONFIG = {
     "stream_heartbeat_sec": 10,
     "agent_request_budget_sec": 300,
     "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
+    "google_browser_headers": {
+      "x-browser-channel": "stable",
+      "x-browser-copyright": "Copyright 2026 Google LLC. All Rights Reserved.",
+      "x-browser-validation": "YXjt/if5gRhK4M5qXvb22nUeBck=",
+      "x-browser-year": "2026",
+      "x-client-data": "CKmdygEIlaHLAQiGoM0B"
+    },
     "auth_user": None,
     "xsrf_token": None,
     "default_model": "gemini-3.6-flash",
