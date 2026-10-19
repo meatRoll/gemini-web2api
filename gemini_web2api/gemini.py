@@ -303,22 +303,6 @@ def _google_browser_headers() -> dict:
     return defaults
 
 
-def _google_browser_headers() -> dict:
-    """Return browser identity headers captured from the successful Gemini Web HAR."""
-    defaults = {
-        "x-browser-channel": "stable",
-        "x-browser-copyright": "Copyright 2026 Google LLC. All Rights Reserved.",
-        "x-browser-validation": "YXjt/if5gRhK4M5qXvb22nUeBck=",
-        "x-browser-year": "2026",
-        "x-client-data": "CKmdygEIlaHLAQiGoM0B",
-    }
-    configured = CONFIG.get("google_browser_headers")
-    if isinstance(configured, dict):
-        defaults.update({key: value for key, value in configured.items()
-                         if key in defaults and isinstance(value, str) and value})
-    return defaults
-
-
 def _google_user_agent() -> str:
     value = CONFIG.get("google_user_agent")
     return value if isinstance(value, str) and value else (
@@ -649,8 +633,8 @@ def _generate_image_raw_with_curl(prompt: str) -> str:
     page_tokens = _cached_page_tokens(max_age=0)
     request_uuid = str(uuid.uuid4()).upper()
     body = _build_image_payload(prompt, request_uuid, xsrf_token=page_tokens.get("at"))
-    headers = _build_headers(request_uuid)
-    headers.update(_image_model_headers(page_tokens, str(uuid.uuid4()).upper()))
+    headers = _build_headers(request_uuid=request_uuid)
+    headers.update(_image_model_headers(page_tokens, request_uuid))
     request_args = {
         "data": body,
         "headers": headers,
