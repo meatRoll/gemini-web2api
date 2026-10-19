@@ -13,6 +13,7 @@ DEFAULT_CONFIG = {
     "agent_request_budget_sec": 300,
     "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
     "google_user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36",
+    "image_rpc_debug_file": None,
     "google_browser_headers": {
       "x-browser-channel": "stable",
       "x-browser-copyright": "Copyright 2026 Google LLC. All Rights Reserved.",
