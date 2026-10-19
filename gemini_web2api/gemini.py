@@ -89,6 +89,78 @@ def log(msg: str, force: bool = False):
     sys.stderr.flush()
 
 
+def _write_image_rpc_diagnostic(record: dict) -> None:
+    """Append bounded c8o8Fe diagnostics without credentials or signed URLs."""
+    path = CONFIG.get("image_rpc_debug_file")
+    if not path:
+        return
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+    except (OSError, TypeError, ValueError):
+        return
+
+
+def _hash_value(value) -> str:
+    if isinstance(value, bytes):
+        data = value
+    else:
+        data = str(value).encode("utf-8")
+    return hashlib.sha256(data).hexdigest()
+
+
+def _image_rpc_url_metadata(url: str) -> dict:
+    parsed = urllib.parse.urlsplit(url)
+    return {
+        "host": parsed.hostname or "",
+        "path_len": len(parsed.path),
+        "path_sha256": _hash_value(parsed.path)[:16],
+        "url_len": len(url),
+        "url_sha256": _hash_value(url)[:16],
+        "query_keys": sorted({key for key, _value in urllib.parse.parse_qsl(parsed.query)}),
+    }
+
+
+def _build_image_rpc_diagnostic(image, payload: list, params: dict, body: str, headers: dict) -> dict:
+    rpc_info = getattr(image, "rpc_payload", None)
+    context = rpc_info.get("context") if isinstance(rpc_info, dict) else None
+    signature = rpc_info.get("signature") if isinstance(rpc_info, dict) else ""
+    header = json.loads(headers.get("x-goog-ext-525001261-jspb", "[]"))
+    return {
+        "event": "request",
+        "payload_len": len(json.dumps(payload, ensure_ascii=False, separators=(",", ":"))),
+        "payload_sha256": _hash_value(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))[:16],
+        "form_len": len(body),
+        "build": params.get("bl", ""),
+        "source_path": params.get("source-path", ""),
+        "reqid": params.get("_reqid"),
+        "f_sid_sha256": _hash_value(params.get("f.sid", ""))[:16],
+        "at_present": bool(body and "at=" in body),
+        "placeholder": payload[0][1][0],
+        "variant": payload[0][1][1],
+        "artifact_id": payload[0][8],
+        "image_id": payload[0][9],
+        "rid": payload[1][0],
+        "rcid": payload[1][1],
+        "cid": payload[1][2],
+        "context_len": len(context) if isinstance(context, list) else None,
+        "context_sha256": _hash_value(json.dumps(context, ensure_ascii=False, separators=(",", ":")))[:16],
+        "signature_sha256": _hash_value(signature)[:16],
+        "model_header_len": len(header),
+        "model_header_uuid": header[16] if len(header) > 16 else None,
+        "model_header_timing": header[19] if len(header) > 19 else None,
+        "x_client_data": headers.get("x-client-data", ""),
+        "user_agent": headers.get("User-Agent", ""),
+    }
+
+
 def _get_ssl_ctx():
     global _ssl_ctx
     if _ssl_ctx is None:
@@ -696,6 +768,7 @@ def get_full_size_image(image) -> str | None:
     if not HAS_CURL_CFFI or not all(isinstance(value, str) and value for value in
                                     (image.cid, image.rid, image.rcid, image.image_id)):
         return None
+    diagnostic = None
     try:
         from .multimodal import _cached_page_tokens
         started = time.monotonic()
@@ -728,15 +801,30 @@ def get_full_size_image(image) -> str | None:
             args["proxy"] = CONFIG["proxy"]
         url = (f"https://gemini.google.com{_account_prefix()}/_/BardChatUi/data/"
                f"batchexecute?{urllib.parse.urlencode(params)}")
+        diagnostic = _build_image_rpc_diagnostic(image, payload, params, body, headers)
+        _write_image_rpc_diagnostic(diagnostic)
         response = curl_requests.post(url, **args)
         try:
+            raw = response.text
+            diagnostic.update({
+                "event": "response",
+                "status": response.status_code,
+                "response_len": len(raw),
+                "response_sha256": _hash_value(raw)[:16],
+            })
             response.raise_for_status()
-            return _batch_response_url(response.text)
+            source_url = _batch_response_url(raw)
+            diagnostic["source_url"] = _image_rpc_url_metadata(source_url)
+            _write_image_rpc_diagnostic(diagnostic)
+            return source_url
         finally:
             close = getattr(response, "close", None)
             if close:
                 close()
     except Exception as exc:
+        if diagnostic is not None:
+            diagnostic.update({"event": "error", "error": safe_error_message(exc)})
+            _write_image_rpc_diagnostic(diagnostic)
         log(f"Full-size image RPC unavailable: {safe_error_message(exc)}")
         return None
 
