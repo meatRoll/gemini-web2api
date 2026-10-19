@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from .config import CONFIG
-from .gemini import load_cookie, _account_prefix, _build_headers, _get_ssl_ctx, log
+from .gemini import load_cookie, _account_prefix, _build_headers, _get_ssl_ctx, _next_reqid, log
 
 RPC_ID = "otAQ7b"
 MIN_INTERVAL_SEC = 3600
@@ -155,7 +155,7 @@ def fetch_account_models():
         raise ModelResponseError("XSRF token required")
     prefix = _account_prefix()
     params = {"rpcids": RPC_ID, "hl": "en", "rt": "c",
-              "_reqid": int(time.time()) % 1000000,
+              "_reqid": _next_reqid(),
               "source-path": prefix + "/app", "bl": CONFIG["gemini_bl"]}
     url = ("https://gemini.google.com" + prefix + "/_/BardChatUi/data/batchexecute?"
            + urllib.parse.urlencode(params))
