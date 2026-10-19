@@ -604,15 +604,14 @@ def _build_full_size_rpc_payload(image) -> list:
         context = rpc_info.get("context")
         if isinstance(signature, str) and signature and isinstance(context, list):
             context = list(context)
-            session_id = rpc_info.get("session_id")
-            if not isinstance(session_id, str) or not session_id:
-                alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
-                session_id = "".join(secrets.choice(alphabet) for _ in range(16))
+            image_id = image.image_id
+            if not isinstance(image_id, str) or not image_id:
+                raise ValueError("generated image metadata has no image ID")
             return [
                 [[None, None, None, [None, None, None, None, None, signature]],
-                 [image.image_id, 0], None, context, None, None, None, None,
-                 rpc_info.get("content_id", ""), session_id],
-                [image.rid, image.rcid, image.cid, None, session_id],
+                 [image_id, 0], None, context, None, None, None, None,
+                 rpc_info.get("content_id", ""), image_id],
+                [image.rid, image.rcid, image.cid, None, image_id],
                 1, 0, 1,
             ]
     return [
