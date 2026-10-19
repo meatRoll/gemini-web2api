@@ -34,6 +34,16 @@ _ssl_ctx = None
 _cookie_cache = {"str": "", "sapisid": None, "mtime": 0, "path": None}
 _httpx_client = None
 _log_lock = threading.Lock()
+_reqid_lock = threading.Lock()
+_reqid = random.randint(1000, 9999)
+
+
+def _next_reqid() -> int:
+    """Match Gemini Web's four-digit base plus 100000 request sequence."""
+    global _reqid
+    with _reqid_lock:
+        _reqid += 100000
+        return _reqid
 
 
 def _rotate_log_file(path: str, max_bytes: int, backup_count: int) -> None:
@@ -389,7 +399,7 @@ def _build_image_payload(prompt: str, request_uuid: str, xsrf_token: str = None)
 
 
 def _get_url(session_id: str = None) -> str:
-    reqid = int(time.time()) % 1000000
+    reqid = _next_reqid()
     account_prefix = _account_prefix()
     params = {"bl": CONFIG["gemini_bl"], "hl": "en", "_reqid": reqid, "rt": "c"}
     if session_id:
@@ -702,7 +712,7 @@ def get_full_size_image(image) -> str | None:
         ))
         conversation_id = image.cid[2:] if image.cid.startswith("c_") else image.cid
         params = {
-            "rpcids": "c8o8Fe", "hl": "zh-CN", "_reqid": int(time.time()) % 1000000,
+            "rpcids": "c8o8Fe", "hl": "zh-CN", "_reqid": _next_reqid(),
             "rt": "c", "source-path": f"{_account_prefix()}/app/{conversation_id}",
             "bl": CONFIG["gemini_bl"],
         }
