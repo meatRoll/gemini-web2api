@@ -719,6 +719,17 @@ def _build_full_size_rpc_headers(
     }
 
 
+def _jspb_booleans(value):
+    """Serialize JSPB booleans as numeric 0/1 values recursively."""
+    if isinstance(value, bool):
+        return 1 if value else 0
+    if isinstance(value, list):
+        return [_jspb_booleans(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _jspb_booleans(item) for key, item in value.items()}
+    return value
+
+
 def _build_full_size_rpc_payload(image) -> list:
     """Build c8o8Fe's rich generated-image payload when metadata is available."""
     rpc_info = getattr(image, "rpc_payload", None)
@@ -730,12 +741,23 @@ def _build_full_size_rpc_payload(image) -> list:
             image_id = image.image_id
             if not isinstance(image_id, str) or not image_id:
                 raise ValueError("generated image metadata has no image ID")
+            request_context = [None] * 23
+            if isinstance(context[0] if len(context) > 0 else None, int):
+                request_context[0] = context[0]
+            if isinstance(context[1] if len(context) > 1 else None, str):
+                request_context[1] = context[1]
+            source_flag = context[16] if len(context) > 16 else 0
+            request_context[16] = 1 if source_flag is True or source_flag == 1 else 0
+            if len(context) > 18:
+                request_context[18] = context[18]
+            if len(context) > 22:
+                request_context[22] = _jspb_booleans(context[22])
             placeholder_url = rpc_info.get("placeholder_url")
             if not isinstance(placeholder_url, str) or not placeholder_url:
                 placeholder_url = image.image_id
             return [
                 [[None, None, None, [None, None, None, None, None, signature]],
-                 [placeholder_url, 0], None, context, None, None, None, None,
+                 [placeholder_url, 0], None, request_context, None, None, None, None,
                  rpc_info.get("content_id", ""), image_id],
                 [image.rid, image.rcid, image.cid, None, image_id],
                 1, 0, 1,
