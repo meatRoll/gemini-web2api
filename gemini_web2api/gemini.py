@@ -205,6 +205,22 @@ def _image_model_headers(page_tokens: dict, session_uuid: str = None) -> dict:
     return headers
 
 
+def _google_browser_headers() -> dict:
+    """Return browser identity headers captured from the successful Gemini Web HAR."""
+    defaults = {
+        "x-browser-channel": "stable",
+        "x-browser-copyright": "Copyright 2026 Google LLC. All Rights Reserved.",
+        "x-browser-validation": "YXjt/if5gRhK4M5qXvb22nUeBck=",
+        "x-browser-year": "2026",
+        "x-client-data": "CKmdygEIlaHLAQiGoM0B",
+    }
+    configured = CONFIG.get("google_browser_headers")
+    if isinstance(configured, dict):
+        defaults.update({key: value for key, value in configured.items()
+                         if key in defaults and isinstance(value, str) and value})
+    return defaults
+
+
 def _build_headers(session_hash=None, request_uuid=None) -> dict:
     cookie_str, sapisid = load_cookie()
     account_prefix = _account_prefix()
@@ -215,6 +231,7 @@ def _build_headers(session_hash=None, request_uuid=None) -> dict:
         "X-Same-Domain": "1",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     }
+    headers.update(_google_browser_headers())
     if request_uuid:
         headers["x-goog-ext-525005358-jspb"] = json.dumps([request_uuid, 1])
     if account_prefix:
