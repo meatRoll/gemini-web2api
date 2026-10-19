@@ -179,7 +179,7 @@ class PageTokenTests(unittest.TestCase):
         for token_key in ("SNlM0e", "thykhd"):
             with self.subTest(token_key=token_key):
                 response = io.BytesIO(json.dumps({"FdrFJe": "sid", token_key: "token\\escaped"}).encode())
-                with mock.patch.object(multimodal.urllib.request, "urlopen", return_value=response) as request:
+                with mock.patch.object(multimodal, "HAS_CURL_CFFI", False), mock.patch.object(multimodal.urllib.request, "urlopen", return_value=response) as request:
                     tokens = multimodal._get_page_tokens(timeout=5)
                 self.assertEqual(tokens, {"f_sid": "sid", "at": "token\\escaped"})
                 outgoing = request.call_args.args[0]
@@ -190,7 +190,7 @@ class PageTokenTests(unittest.TestCase):
 
     def test_page_tokens_accept_current_gemini_web_build(self):
         html = b'"FdrFJe":"sid","SNlM0e":"token","boq_gemini-web-uiserver_20261014.17_p0"'
-        with mock.patch.object(multimodal.urllib.request, "urlopen", return_value=io.BytesIO(html)):
+        with mock.patch.object(multimodal, "HAS_CURL_CFFI", False), mock.patch.object(multimodal.urllib.request, "urlopen", return_value=io.BytesIO(html)):
             tokens = multimodal._get_page_tokens(timeout=5)
         self.assertEqual(tokens, {"f_sid": "sid", "at": "token"})
         self.assertEqual(CONFIG["gemini_bl"], "boq_gemini-web-uiserver_20261014.17_p0")

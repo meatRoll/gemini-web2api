@@ -40,6 +40,8 @@ def _get_page_tokens(timeout=30) -> dict:
         "Sec-Fetch-Site": "none",
         "Sec-Fetch-User": "?1",
         "Upgrade-Insecure-Requests": "1",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
         "User-Agent": _google_user_agent(),
     }
     headers.update(_google_browser_headers())
@@ -49,21 +51,41 @@ def _get_page_tokens(timeout=30) -> dict:
         headers["Cookie"] = cookie_str
     if sapisid:
         headers["Authorization"] = make_sapisidhash(sapisid)
+    proxy = CONFIG.get("proxy")
     try:
-        req = urllib.request.Request(f"https://gemini.google.com{account_prefix}/app", headers=headers)
-        proxy = CONFIG.get("proxy")
-        if proxy:
-            opener = urllib.request.build_opener(
-                urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
-                urllib.request.HTTPSHandler(context=_get_ssl_ctx()),
+        html = None
+        if HAS_CURL_CFFI:
+            request_args = {
+                "headers": headers,
+                "timeout": min(30, timeout),
+                "impersonate": "chrome",
+            }
+            if proxy:
+                request_args["proxy"] = proxy
+            resp = curl_requests.get(
+                f"https://gemini.google.com{account_prefix}/app", **request_args
             )
-            resp = opener.open(req, timeout=min(30, timeout))
+            try:
+                resp.raise_for_status()
+                html = resp.text
+            finally:
+                close = getattr(resp, "close", None)
+                if close:
+                    close()
         else:
-            resp = urllib.request.urlopen(req, context=_get_ssl_ctx(), timeout=min(30, timeout))
-        try:
-            html = resp.read().decode("utf-8", errors="replace")
-        finally:
-            resp.close()
+            req = urllib.request.Request(f"https://gemini.google.com{account_prefix}/app", headers=headers)
+            if proxy:
+                opener = urllib.request.build_opener(
+                    urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
+                    urllib.request.HTTPSHandler(context=_get_ssl_ctx()),
+                )
+                resp = opener.open(req, timeout=min(30, timeout))
+            else:
+                resp = urllib.request.urlopen(req, context=_get_ssl_ctx(), timeout=min(30, timeout))
+            try:
+                html = resp.read().decode("utf-8", errors="replace")
+            finally:
+                resp.close()
         tokens = {}
         for key, candidates in {
             "push_id": (r'"qKIAYe":\s*"([^"\\]*(?:\\.[^"\\]*)*)"',),
