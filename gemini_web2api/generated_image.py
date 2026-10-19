@@ -255,6 +255,7 @@ def extract_generation_result(raw: str, clean_text) -> GenerationResult:
                             image_metadata = _nested(rpc_entry, [0, 3], [])
                         signature = _nested(image_metadata, [5], "")
                         context = _nested(rpc_entry, [3], None)
+                        placeholder_url = _nested(rpc_entry, [1, 0], "")
                         content_id = _nested(rpc_entry, [8], "")
                         prompt = _nested(context, [1], "") if isinstance(context, list) else ""
                         if not prompt:
@@ -265,6 +266,9 @@ def extract_generation_result(raw: str, clean_text) -> GenerationResult:
                                 "signature": signature,
                                 "context": context,
                                 "prompt": prompt,
+                                "placeholder_url": (placeholder_url
+                                                     if isinstance(placeholder_url, str)
+                                                     else ""),
                                 "content_id": content_id if isinstance(content_id, str) else "",
                             }
                     images.append(GeneratedImage(

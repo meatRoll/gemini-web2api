@@ -634,11 +634,14 @@ class StreamingEndpointTests(unittest.TestCase):
                 "context": context,
                 "prompt": "a red circle",
                 "session_id": "session-1",
+                "placeholder_url": "http://googleusercontent.com/image_generation_content/0_783",
             },
         )
         payload = gemini._build_full_size_rpc_payload(image)
         self.assertEqual(payload[0][0][3][5], "image-signature")
-        self.assertEqual(payload[0][1], ["v5kua7v5kua7v5ku", 0])
+        self.assertEqual(payload[0][1], [
+            "http://googleusercontent.com/image_generation_content/0_783", 0
+        ])
         self.assertEqual(payload[0][3][1], "upstream prompt")
         self.assertEqual(payload[0][3][16], 0)
         self.assertIsNone(payload[0][3][20])
