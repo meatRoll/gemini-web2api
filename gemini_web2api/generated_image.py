@@ -385,6 +385,12 @@ def _request_args(stream: bool) -> dict:
     if isinstance(configured, dict):
         browser_headers.update({key: value for key, value in configured.items()
                                 if key in browser_headers and isinstance(value, str) and value})
+    user_agent = CONFIG.get("google_user_agent")
+    if not isinstance(user_agent, str) or not user_agent:
+        user_agent = (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36"
+        )
     args = {
         "headers": {
             "Accept": "*/*",
@@ -396,6 +402,7 @@ def _request_args(stream: bool) -> dict:
             "Sec-Fetch-Dest": "empty",
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Site": "cross-site",
+            "User-Agent": user_agent,
             **browser_headers,
         },
         "timeout": CONFIG["request_timeout_sec"],

@@ -144,7 +144,7 @@ class AuthSyncTests(unittest.TestCase):
             self.assertEqual(parse_qs(request.data.decode())["at"], [token])
             self.assertEqual(parse_qs(urlsplit(request.full_url).query)["bl"], [build])
             self.assertIn(f"/u/{user}/", request.full_url)
-            self.assertIn(f"/u/{user}/app", request.get_header("Referer"))
+            self.assertIn(f"/u/{user}/", request.get_header("Referer"))
 
     def test_stream_uses_export_metadata_before_building_request(self):
         client = mock.MagicMock()
@@ -621,15 +621,20 @@ class StreamingEndpointTests(unittest.TestCase):
             "x-browser-year": "2026",
             "x-client-data": "CKmdygEIlaHLAQiGoM0B",
         }
-        self.assertEqual(
-            {key: gemini._build_headers()[key] for key in expected}, expected
-        )
+        headers = gemini._build_headers()
+        self.assertEqual({key: headers[key] for key in expected}, expected)
+        self.assertEqual(headers["User-Agent"], CONFIG["google_user_agent"])
+        self.assertEqual(headers["Content-Type"], "application/x-www-form-urlencoded;charset=utf-8")
+        self.assertEqual(headers["Referer"], "https://gemini.google.com/")
+        self.assertEqual(headers["Sec-Fetch-Site"], "same-origin")
         from gemini_web2api.generated_image import _request_args
+        download_headers = _request_args(stream=True)["headers"]
         self.assertEqual(
-            {key.lower(): value for key, value in _request_args(stream=True)["headers"].items()
+            {key.lower(): value for key, value in download_headers.items()
              if key.lower() in expected},
             expected,
         )
+        self.assertEqual(download_headers["User-Agent"], CONFIG["google_user_agent"])
 
     def test_generated_image_id_matches_gemini_web_fallback(self):
         from gemini_web2api.generated_image import _generated_image_id
