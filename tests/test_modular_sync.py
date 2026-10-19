@@ -636,6 +636,30 @@ class StreamingEndpointTests(unittest.TestCase):
         )
         self.assertEqual(download_headers["User-Agent"], CONFIG["google_user_agent"])
 
+    def test_full_size_payload_reserializes_response_context_as_sparse_jspb(self):
+        from gemini_web2api.generated_image import GeneratedImage
+        response_context = [None] * 23
+        response_context[0] = 22
+        response_context[1] = "response prompt"
+        response_context[16] = False
+        response_context[18] = "imagen_default.ultra.complaintflow"
+        response_context[20] = 3836647544
+        response_context[22] = [None, True, [False]]
+        image = GeneratedImage(
+            "https://lh3.googleusercontent.com/generated",
+            image_id="image-id", cid="c_1", rid="r_1", rcid="rc_1",
+            rpc_payload={"signature": "sig", "context": response_context,
+                         "placeholder_url": "http://googleusercontent.com/image_generation_content/0_1"},
+        )
+        payload = gemini._build_full_size_rpc_payload(image)
+        context = payload[0][3]
+        self.assertEqual(context[0:2], [22, "response prompt"])
+        self.assertEqual(context[16], 0)
+        self.assertEqual(context[18], "imagen_default.ultra.complaintflow")
+        self.assertIsNone(context[20])
+        self.assertEqual(context[22], [None, 1, [0]])
+
+
     def test_generated_image_id_matches_gemini_web_fallback(self):
         from gemini_web2api.generated_image import _generated_image_id
         self.assertEqual(
