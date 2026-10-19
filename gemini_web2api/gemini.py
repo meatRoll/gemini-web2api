@@ -614,9 +614,12 @@ def _build_full_size_rpc_payload(image) -> list:
             image_id = image.image_id
             if not isinstance(image_id, str) or not image_id:
                 raise ValueError("generated image metadata has no image ID")
+            placeholder_url = rpc_info.get("placeholder_url")
+            if not isinstance(placeholder_url, str) or not placeholder_url:
+                placeholder_url = image.image_id
             return [
                 [[None, None, None, [None, None, None, None, None, signature]],
-                 [image_id, 0], None, context, None, None, None, None,
+                 [placeholder_url, 0], None, context, None, None, None, None,
                  rpc_info.get("content_id", ""), image_id],
                 [image.rid, image.rcid, image.cid, None, image_id],
                 1, 0, 1,
