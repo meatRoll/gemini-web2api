@@ -613,7 +613,13 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(header[17], [CONFIG["gemini_bl"]])
         self.assertEqual(headers["x-goog-ext-73010989-jspb"], "[0]")
 
-    def test_full_size_rpc_payload_uses_generated_image_context(self):
+    def test_generated_image_id_matches_gemini_web_fallback(self):
+        from gemini_web2api.generated_image import _generated_image_id
+        self.assertEqual(
+            _generated_image_id("rc_46d9372eef639b6b", 0, 0),
+            "v5kua7v5kua7v5ku",
+        )
+
         from gemini_web2api.generated_image import GeneratedImage
         context = [None] * 23
         context[0] = 22
