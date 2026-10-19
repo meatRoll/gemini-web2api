@@ -72,6 +72,25 @@ class AttachmentTransportTests(unittest.TestCase):
         self.response.close.assert_called_once()
         self.session.close.assert_called_once()
 
+    def test_image_generation_reuses_body_uuid_in_request_headers(self):
+        request_uuid = "11111111-2222-4333-8444-555555555555"
+        response = mock.MagicMock()
+        response.text = "image-result"
+        with mock.patch.object(gemini, "HAS_CURL_CFFI", True), \
+                mock.patch.object(gemini.uuid, "uuid4", return_value=request_uuid), \
+                mock.patch.object(multimodal, "_cached_page_tokens", return_value={"at": "token", "f_sid": "sid"}), \
+                mock.patch.object(gemini, "_build_image_payload", return_value="body") as payload, \
+                mock.patch.object(gemini, "_build_headers", return_value={}) as headers, \
+                mock.patch.object(gemini, "_image_model_headers", return_value={}) as model_headers, \
+                mock.patch.object(gemini, "_get_url", return_value="https://gemini.test/stream"), \
+                mock.patch.object(gemini, "curl_requests") as requests:
+            requests.post.return_value = response
+            result = gemini._generate_image_raw_with_curl("draw")
+        self.assertEqual(result, "image-result")
+        payload.assert_called_once_with("draw", request_uuid, xsrf_token="token")
+        headers.assert_called_once_with(request_uuid=request_uuid)
+        model_headers.assert_called_once_with({"at": "token", "f_sid": "sid"}, request_uuid)
+
     def test_text_and_legacy_attachments_remain_compatible(self):
         text = _decode_payload(gemini._build_payload("hello", 1, 4))
         self.assertEqual(len(text), 102)
