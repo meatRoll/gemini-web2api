@@ -621,7 +621,7 @@ class StreamingEndpointTests(unittest.TestCase):
         context[16] = 0
         image = GeneratedImage(
             "https://lh3.googleusercontent.com/generated",
-            image_id="http://googleusercontent.com/image_generation_content/0_799",
+            image_id="v5kua7v5kua7v5ku",
             cid="c_1", rid="r_1", rcid="rc_1",
             rpc_payload={
                 "signature": "image-signature",
@@ -632,12 +632,14 @@ class StreamingEndpointTests(unittest.TestCase):
         )
         payload = gemini._build_full_size_rpc_payload(image)
         self.assertEqual(payload[0][0][3][5], "image-signature")
-        self.assertEqual(payload[0][1], [image.image_id, 0])
+        self.assertEqual(payload[0][1], ["v5kua7v5kua7v5ku", 0])
         self.assertEqual(payload[0][3][1], "upstream prompt")
         self.assertEqual(payload[0][3][16], 0)
         self.assertIsNone(payload[0][3][20])
         self.assertIsNone(payload[0][3][9])
-        self.assertEqual(payload[1][4], "session-1")
+        self.assertEqual(payload[0][8], "")
+        self.assertEqual(payload[0][9], "v5kua7v5kua7v5ku")
+        self.assertEqual(payload[1][4], "v5kua7v5kua7v5ku")
 
 
     @mock.patch(
