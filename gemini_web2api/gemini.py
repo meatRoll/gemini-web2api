@@ -221,15 +221,48 @@ def _google_browser_headers() -> dict:
     return defaults
 
 
+def _google_browser_headers() -> dict:
+    """Return browser identity headers captured from the successful Gemini Web HAR."""
+    defaults = {
+        "x-browser-channel": "stable",
+        "x-browser-copyright": "Copyright 2026 Google LLC. All Rights Reserved.",
+        "x-browser-validation": "YXjt/if5gRhK4M5qXvb22nUeBck=",
+        "x-browser-year": "2026",
+        "x-client-data": "CKmdygEIlaHLAQiGoM0B",
+    }
+    configured = CONFIG.get("google_browser_headers")
+    if isinstance(configured, dict):
+        defaults.update({key: value for key, value in configured.items()
+                         if key in defaults and isinstance(value, str) and value})
+    return defaults
+
+
+def _google_user_agent() -> str:
+    value = CONFIG.get("google_user_agent")
+    return value if isinstance(value, str) and value else (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36"
+    )
+
+
 def _build_headers(session_hash=None, request_uuid=None) -> dict:
     cookie_str, sapisid = load_cookie()
     account_prefix = _account_prefix()
     headers = {
-        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "*/*",
+        "Accept-Encoding": "gzip, deflate, br, zstd",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,ja;q=0.7",
+        "Cache-Control": "no-cache",
+        "Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
         "Origin": "https://gemini.google.com",
-        "Referer": f"https://gemini.google.com{account_prefix}/app",
+        "Pragma": "no-cache",
+        "Priority": "u=1, i",
+        "Referer": f"https://gemini.google.com{account_prefix}/",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
         "X-Same-Domain": "1",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "User-Agent": _google_user_agent(),
     }
     headers.update(_google_browser_headers())
     if request_uuid:
