@@ -580,15 +580,22 @@ def _batch_response_url(raw: str) -> str:
     raise ValueError("full-size image RPC returned no URL")
 
 
-def _build_full_size_rpc_headers(page_tokens: dict, session_uuid: str) -> dict:
+def _build_full_size_rpc_headers(
+    page_tokens: dict,
+    session_uuid: str,
+    elapsed_seconds: int = 0,
+    elapsed_nanos: int = 0,
+) -> dict:
     """Build the c8o8Fe-specific browser model header from the HAR shape."""
     build = CONFIG.get("gemini_bl", "")
+    elapsed = elapsed_seconds if elapsed_seconds > 0 else None
+    now_ns = time.time_ns()
     header = [
         1, None, None, None, None, None, None, 0,
         [4, 5, 6, 8, 16, 19, 20, 4, 5, 6, 8, 16, 19, 20],
         None, None, None, None, None, 6, 1, session_uuid,
         [build], None,
-        [[None, 2200000], [int(time.time()), 108000000]],
+        [[elapsed, elapsed_nanos], [now_ns // 1_000_000_000, (now_ns // 1_000_000) % 1000 * 1_000_000]],
     ]
     return {
         "x-goog-ext-525001261-jspb": json.dumps(header),
@@ -628,12 +635,18 @@ def get_full_size_image(image) -> str | None:
         return None
     try:
         from .multimodal import _cached_page_tokens
+        started = time.monotonic()
         page_tokens = _cached_page_tokens(max_age=0)
         payload = _build_full_size_rpc_payload(image)
         rpc = ["c8o8Fe", json.dumps(payload), None, "generic"]
         session_uuid = str(uuid.uuid4()).upper()
         headers = _build_headers()
-        headers.update(_build_full_size_rpc_headers(page_tokens, session_uuid))
+        elapsed = max(0.0, time.monotonic() - started)
+        elapsed_seconds = int(elapsed)
+        elapsed_nanos = int((elapsed - elapsed_seconds) * 1000) * 1_000_000
+        headers.update(_build_full_size_rpc_headers(
+            page_tokens, session_uuid, elapsed_seconds, elapsed_nanos
+        ))
         conversation_id = image.cid[2:] if image.cid.startswith("c_") else image.cid
         params = {
             "rpcids": "c8o8Fe", "hl": "zh-CN", "_reqid": int(time.time()) % 1000000,
