@@ -19,6 +19,7 @@ from .config import CONFIG
 from .gemini import (
     HAS_CURL_CFFI, curl_requests, load_cookie, make_sapisidhash,
     _account_prefix, _get_ssl_ctx, log, safe_error_message,
+    _google_browser_headers, _google_user_agent,
 )
 
 _MAX_REMOTE_IMAGE_BYTES = 10 * 1024 * 1024
@@ -31,9 +32,17 @@ def _get_page_tokens(timeout=30) -> dict:
     cookie_str, sapisid = load_cookie()
     account_prefix = _account_prefix()
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer": f"https://gemini.google.com{account_prefix}/app",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/jxl,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br, zstd",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,ja;q=0.7",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+        "User-Agent": _google_user_agent(),
     }
+    headers.update(_google_browser_headers())
     if account_prefix:
         headers["X-Goog-AuthUser"] = str(CONFIG["auth_user"])
     if cookie_str:
