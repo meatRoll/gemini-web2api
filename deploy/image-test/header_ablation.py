@@ -87,6 +87,7 @@ class Experiment:
         from gemini_web2api.gemini import load_cookie, _batch_response_url
         self.args = args
         self.parse_rpc = _batch_response_url
+        self.load_current_cookie = load_cookie
         self.root = Path(args.output)
         self.root.mkdir(mode=0o700, parents=True, exist_ok=False)
         (self.root / 'requests.jsonl').touch(mode=0o600)
@@ -108,8 +109,11 @@ class Experiment:
         def debug(kind, data):
             if kind == 2:
                 self.wire_names.update(captured_header_names(data))
-        self.session = requests.Session(impersonate='chrome', default_headers=False,
+        self.make_session = lambda: requests.Session(
+            impersonate='chrome', default_headers=False,
             curl_options={CurlOpt.VERBOSE: 1, CurlOpt.DEBUGFUNCTION: debug})
+        self.session = None
+        self.current_test = None
         self.rows = []
         self.records = []
         self.seq = self.case_id = 0
@@ -120,13 +124,14 @@ class Experiment:
         self.rng = random.Random(20261020)
         write_json(self.root / 'manifest.json', {
             'har': args.har, 'interval_between_cases_seconds': args.interval,
-            'cookie_sha256': digest(self.cookie.encode())[:16],
+            'initial_cookie_sha256': digest(self.cookie.encode())[:16],
+            'credential_policy': 'read current service Cookie after cooldown before each case; log its hash only',
             'rpc_body_sha256': digest(self.rpc['body'].encode()),
             'expected_image_sha256': args.image_sha256,
             'new_generation': False, 'egress': 'panel2_direct',
             'fields': self.fields, 'scope': 'necessity in this account/session only',
             'wire_absence_checked': True, 'case_success': 'exact known JPEG bytes and dimensions',
-            'session_scope': 'shared Session and response Cookie jar',
+            'session_scope': 'fresh Session and empty response Cookie jar per case; shared only within its media chain',
             'media_cookies': 'explicit login Cookie only on exact Google mediator allowlist',
             'pacing': 'at most four sequential requests per case, no parallelism or retries; cooldown after each case',
         })
@@ -137,6 +142,8 @@ class Experiment:
         write_json(self.root / 'progress.json', {
             'status': self.status, 'requests': self.seq, 'cases': self.case_id,
             'completed_ablations': len(self.rows), 'total_chain_fields': len(self.fields),
+            'confirmed_ablations': sum(row['classification'].startswith('removal_') for row in self.rows),
+            'current_test': self.current_test,
             'elapsed_seconds': round(time.time() - self.started),
             'last_record': self.records[-1] if self.records else None,
             'next_case_not_before_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() + remaining)),
@@ -149,7 +156,7 @@ class Experiment:
         lines = ['# Existing-image header ablation', '',
             f'Status: {self.status}. No image generation. At least {self.args.interval:g} seconds after each case.', '',
             'Each case removes one field from the full baseline and requires the exact known JPEG. Chain cases omit it wherever it occurs; failed fields are subsequently isolated by stage. Other headers and the recorded RPC body/query stay unchanged.', '',
-            'A shared HTTP Session is preserved. Curl field restoration and jar-generated Cookie are explicitly suppressed for the selected field, and outgoing names are checked. Short-lived media hops are followed immediately; there are no parallel calls or retries.', '',
+            'A fresh HTTP Session and current account Cookie are used per case. Session response cookies are retained within the chain and discarded afterward. Authentication hashes are recorded; values are not. Curl field restoration and jar-generated Cookie are explicitly suppressed for the selected field, and outgoing names are checked. Short-lived media hops are followed immediately; there are no parallel calls or retries.', '',
             'Successful controls bracket each group. Pending groups are inconclusive. Individual removability does not prove that all passing fields may be removed together.', '',
             '| Scope | Removed field | Exact JPEG | First failed stage | Classification |',
             '| --- | --- | --- | --- | --- |']
@@ -160,12 +167,16 @@ class Experiment:
     def wait(self):
         self.status = 'waiting_between_cases'
         self.publish()
+        next_heartbeat = time.monotonic() + 15
         while True:
             if (self.root / 'STOP').exists():
                 raise StopExperiment('operator_stop_file')
             remaining = self.args.interval - (time.monotonic() - self.last_case_end)
             if remaining <= 0:
                 return
+            if time.monotonic() >= next_heartbeat:
+                self.publish()
+                next_heartbeat = time.monotonic() + 15
             time.sleep(min(remaining, 1))
 
     def check_url(self, value, stage):
@@ -193,6 +204,7 @@ class Experiment:
         self.seq += 1
         record = {'seq': self.seq, 'case_id': self.case_id, 'stage': stage,
                   'removed_header': omitted, 'started_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                  'account_cookie_sha256': digest(self.cookie.encode())[:16],
                   'host': urlsplit(url).hostname, 'url_sha256': digest(url.encode())[:16]}
         try:
             response = self.session.request('POST' if stage == 'rpc' else 'GET', url,
@@ -253,9 +265,17 @@ class Experiment:
             print(json.dumps(record), flush=True)
 
     def case(self, omitted=None, scope='chain'):
+        self.current_test = {'scope': scope, 'removed_header': omitted,
+                             'role': 'ablation' if omitted else 'control'}
         self.wait()
         self.case_id += 1
         self.status = 'running_case'
+        self.cookie, _ = self.load_current_cookie()
+        if not self.cookie:
+            raise StopExperiment('missing_current_cookie')
+        self.headers['rpc']['cookie'] = self.cookie
+        self.headers['mediator']['cookie'] = self.cookie
+        self.session = self.make_session()
         url = self.rpc['url']
         try:
             for stage in self.stages:
@@ -269,6 +289,8 @@ class Experiment:
                     url = initial_media_url(next_url) if stage == 'rpc' else next_url
             return True, ''
         finally:
+            self.session.close()
+            self.session = None
             self.last_case_end = time.monotonic()
             self.publish()
 
@@ -312,10 +334,17 @@ class Experiment:
             self.status = 'completed'
         except StopExperiment as exc:
             self.status = 'stopped_' + str(exc)
+            for row in self.rows:
+                if row['classification'] == 'awaiting_control':
+                    row['classification'] = 'inconclusive_control_not_completed'
         except Exception as exc:
             self.status = 'stopped_exception_' + type(exc).__name__
+            for row in self.rows:
+                if row['classification'] == 'awaiting_control':
+                    row['classification'] = 'inconclusive_control_not_completed'
         finally:
-            self.session.close()
+            if self.session is not None:
+                self.session.close()
             self.publish()
             print(json.dumps({'status':self.status,'requests':self.seq,
                 'completed_ablations':len(self.rows),'output':str(self.root)}),flush=True)
@@ -330,7 +359,7 @@ def main():
     parser.add_argument('--package-root',required=True)
     parser.add_argument('--output',required=True)
     parser.add_argument('--interval',type=float,default=180)
-    parser.add_argument('--group-size',type=int,default=5)
+    parser.add_argument('--group-size',type=int,default=1)
     parser.add_argument('--image-sha256',default='673a7253133214e00edd8421cb5261ddb17dd7f2f3ea65cc74a5c6c9a3adba39')
     args = parser.parse_args()
     if args.interval < 180:
