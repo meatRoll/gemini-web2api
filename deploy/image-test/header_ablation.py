@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Paced, one-header-at-a-time replay of an existing Gemini image (no generation).
+"""Slow per-header replay of an existing Gemini image, without generation.
 
-Uses HAR export files and current service cookie in memory. Never sends login
-cookies to googleusercontent.com. Run separately from the API service.
+A case follows the whole short-lived media chain immediately, then waits at
+least three minutes before the next case. Private HAR inputs are not included.
 """
 import argparse
 import csv
@@ -53,7 +53,7 @@ def jpeg_size(data):
 
 
 def captured_header_names(data):
-    """Keep outgoing field names only; discard URL and all header values."""
+    """Retain names only. Never log the outgoing URL or header values."""
     result = set()
     for line in data.decode('iso-8859-1').splitlines():
         match = re.match(r'^([A-Za-z0-9-]+):', line)
@@ -77,264 +77,273 @@ class StopExperiment(Exception):
 
 
 class Experiment:
+    stages = ('rpc', 'source', 'mediator', 'final')
+
     def __init__(self, args):
         from curl_cffi import requests, CurlOpt
         sys.path.insert(0, args.package_root)
         from gemini_web2api.config import load_config
         load_config(args.config)
         from gemini_web2api.gemini import load_cookie, _batch_response_url
-        self.parse_rpc = _batch_response_url
-        self.requests, self.CurlOpt = requests, CurlOpt
         self.args = args
+        self.parse_rpc = _batch_response_url
         self.root = Path(args.output)
         self.root.mkdir(mode=0o700, parents=True, exist_ok=False)
-        self.records = []
-        self.rows = []
-        self.last_request = 0.0
-        self.seq = 0
+        (self.root / 'requests.jsonl').touch(mode=0o600)
         self.cookie, _ = load_cookie()
         if not self.cookie:
             raise StopExperiment('missing_current_cookie')
-        rpc_entries = json.loads(Path(args.rpc_input).read_text())
-        self.rpc = next(item['request'] for item in rpc_entries if item['har'] == args.har)
+        entries = json.loads(Path(args.rpc_input).read_text())
+        self.rpc = next(item['request'] for item in entries if item['har'] == args.har)
         self.profiles = json.loads(Path(args.media_headers).read_text())
-        self.stages = {}
-        self.baseline_sha = args.image_sha256
+        rpc_headers = {k.lower(): v for k, v in self.rpc['headers'].items()}
+        rpc_headers['cookie'] = self.cookie
+        mediator_headers = {k.lower(): v for k, v in self.profiles['mediator'].items()}
+        mediator_headers['cookie'] = self.cookie
+        media_headers = {k.lower(): v for k, v in self.profiles['media'].items()}
+        self.headers = {'rpc': rpc_headers, 'source': media_headers,
+                        'mediator': mediator_headers, 'final': media_headers}
+        self.fields = sorted(set().union(*(set(h) for h in self.headers.values())))
+        self.wire_names = set()
+        def debug(kind, data):
+            if kind == 2:
+                self.wire_names.update(captured_header_names(data))
+        self.session = requests.Session(impersonate='chrome', default_headers=False,
+            curl_options={CurlOpt.VERBOSE: 1, CurlOpt.DEBUGFUNCTION: debug})
+        self.rows = []
+        self.records = []
+        self.seq = self.case_id = 0
         self.started = time.time()
-        self.status = 'starting'
+        # Initial wait also prevents a restart from following prior probes rapidly.
+        self.last_case_end = time.monotonic()
+        self.status = 'waiting_initial_cooldown'
         self.rng = random.Random(20261020)
         write_json(self.root / 'manifest.json', {
-            'har': args.har, 'interval_seconds': args.interval,
+            'har': args.har, 'interval_between_cases_seconds': args.interval,
             'cookie_sha256': digest(self.cookie.encode())[:16],
             'rpc_body_sha256': digest(self.rpc['body'].encode()),
-            'expected_image_sha256': self.baseline_sha,
+            'expected_image_sha256': args.image_sha256,
             'new_generation': False, 'egress': 'panel2_direct',
-            'scope': 'single-header necessity in the tested account/session only',
-            'wire_absence_checked': True,
-            'rpc_success_definition': 'c8o8Fe returns a valid allowed source URL; not a per-case full image download',
-            'media_success_definition': 'allowed relay URL; final hop must match exact known JPEG SHA256 and dimensions',
-            'protected_control_hosts': ['gemini.google.com', 'lh3.google.com', 'work.fife.usercontent.google.com'],
+            'fields': self.fields, 'scope': 'necessity in this account/session only',
+            'wire_absence_checked': True, 'case_success': 'exact known JPEG bytes and dimensions',
+            'session_scope': 'shared Session and response Cookie jar',
+            'media_cookies': 'explicit login Cookie only on exact Google mediator allowlist',
+            'pacing': 'at most four sequential requests per case, no parallelism or retries; cooldown after each case',
         })
         self.publish()
 
     def publish(self):
+        remaining = max(0, self.args.interval - (time.monotonic() - self.last_case_end))
         write_json(self.root / 'progress.json', {
-            'status': self.status, 'requests': self.seq,
-            'completed_ablations': len(self.rows),
-            'total_ablations': sum(len(stage['headers']) for stage in self.stages.values()) or None,
+            'status': self.status, 'requests': self.seq, 'cases': self.case_id,
+            'completed_ablations': len(self.rows), 'total_chain_fields': len(self.fields),
             'elapsed_seconds': round(time.time() - self.started),
             'last_record': self.records[-1] if self.records else None,
-            'next_request_not_before_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() + max(0, self.args.interval - (time.monotonic() - self.last_request)))) if self.last_request else None,
+            'next_case_not_before_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() + remaining)),
         })
         with (self.root / 'results.csv').open('w', newline='') as stream:
-            writer = csv.DictWriter(stream, fieldnames=['stage', 'removed_header', 'wire_absent', 'status', 'semantic_success', 'classification', 'request_seq'])
+            writer = csv.DictWriter(stream, fieldnames=['scope', 'removed_header', 'case_id',
+                'jpeg_verified', 'first_failed_stage', 'classification'])
             writer.writeheader()
             writer.writerows(self.rows)
-        lines = ['# Paced HAR3 header ablation', '',
-                 f'Status: {self.status}. No image generation. At least {self.args.interval:g} seconds between completed HTTP requests.', '',
-                 'Each row removes one field from the complete baseline, not from the previous row. Passing alone does not establish that multiple passing fields can all be removed together.', '',
-                 'c8 and relay rows test their immediate semantic response. Only final-image rows check the complete known JPEG SHA256. Successful controls bracket each group; interrupted groups remain inconclusive.', '',
-                 '| Stage | Removed header | Verified absent on wire | HTTP | Semantic success | Classification |',
-                 '| --- | --- | --- | --- | --- | --- |']
+        lines = ['# Existing-image header ablation', '',
+            f'Status: {self.status}. No image generation. At least {self.args.interval:g} seconds after each case.', '',
+            'Each case removes one field from the full baseline and requires the exact known JPEG. Chain cases omit it wherever it occurs; failed fields are subsequently isolated by stage. Other headers and the recorded RPC body/query stay unchanged.', '',
+            'A shared HTTP Session is preserved. Curl field restoration and jar-generated Cookie are explicitly suppressed for the selected field, and outgoing names are checked. Short-lived media hops are followed immediately; there are no parallel calls or retries.', '',
+            'Successful controls bracket each group. Pending groups are inconclusive. Individual removability does not prove that all passing fields may be removed together.', '',
+            '| Scope | Removed field | Exact JPEG | First failed stage | Classification |',
+            '| --- | --- | --- | --- | --- |']
         for row in self.rows:
-            lines.append('| {stage} | {removed_header} | {wire_absent} | {status} | {semantic_success} | {classification} |'.format(**row))
+            lines.append('| {scope} | {removed_header} | {jpeg_verified} | {first_failed_stage} | {classification} |'.format(**row))
         (self.root / 'report.md').write_text('\n'.join(lines) + '\n')
 
-    def pace(self):
+    def wait(self):
+        self.status = 'waiting_between_cases'
+        self.publish()
         while True:
             if (self.root / 'STOP').exists():
                 raise StopExperiment('operator_stop_file')
-            remaining = self.args.interval - (time.monotonic() - self.last_request)
+            remaining = self.args.interval - (time.monotonic() - self.last_case_end)
             if remaining <= 0:
                 return
             time.sleep(min(remaining, 1))
 
-    def valid_url(self, value):
-        parsed = urlsplit(value)
-        if (parsed.scheme != 'https' or parsed.hostname not in
-                {'gemini.google.com', 'lh3.googleusercontent.com', 'lh3.google.com', 'work.fife.usercontent.google.com'}
-                or parsed.username is not None or parsed.password is not None
-                or parsed.port not in (None, 443)):
-            raise StopExperiment('unexpected_response_url')
-        return parsed
+    def check_url(self, value, stage):
+        p = urlsplit(value)
+        allowed = {'rpc': {'gemini.google.com'},
+                   'source': {'lh3.googleusercontent.com'},
+                   'mediator': {'lh3.google.com', 'work.fife.usercontent.google.com'},
+                   'final': {'lh3.googleusercontent.com'}}
+        if (p.scheme != 'https' or p.hostname not in allowed[stage]
+                or p.username is not None or p.password is not None or p.port not in (None, 443)):
+            raise StopExperiment('unexpected_response_url_' + stage)
 
-    def request(self, stage_name, omitted=None, control=False):
-        stage = self.stages[stage_name]
-        self.valid_url(stage['url'])
-        headers = dict(stage['headers'])
+    def request(self, stage, url, omitted=None):
+        self.check_url(url, stage)
+        headers = dict(self.headers[stage])
         if omitted:
-            # curl_cffi None emits "field:" to suppress the field entirely.
-            # An empty string would instead emit an empty-valued header.
+            # None suppresses the field; empty string would send an empty value.
             headers[omitted] = None
-        wire_names = set()
-        def debug(kind, data):
-            if kind == 2:
-                wire_names.update(captured_header_names(data))
-        self.pace()
+        self.wire_names = set()
+        saved_cookies = None
+        if omitted == 'cookie':
+            # A jar-generated Cookie bypasses HTTPHEADER exclusion alone.
+            saved_cookies = self.session.cookies
+            self.session.cookies = {}
         self.seq += 1
-        record = {'seq': self.seq, 'stage': stage_name, 'removed_header': omitted,
-                  'control': control, 'started_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
-                  'request_host': urlsplit(stage['url']).hostname,
-                  'request_url_sha256': digest(stage['url'].encode())[:16]}
-        raw = b''
-        next_url = None
+        record = {'seq': self.seq, 'case_id': self.case_id, 'stage': stage,
+                  'removed_header': omitted, 'started_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                  'host': urlsplit(url).hostname, 'url_sha256': digest(url.encode())[:16]}
         try:
-            with self.requests.Session(impersonate='chrome', default_headers=False,
-                    curl_options={self.CurlOpt.VERBOSE: 1, self.CurlOpt.DEBUGFUNCTION: debug}) as session:
-                response = session.request(stage['method'], stage['url'], headers=headers,
-                    data=stage.get('body'), timeout=25, allow_redirects=False,
-                    accept_encoding='', max_recv_speed=2 * 1024 * 1024)
-                if len(response.content) > 10 * 1024 * 1024:
-                    raise StopExperiment('response_size_limit')
+            response = self.session.request('POST' if stage == 'rpc' else 'GET', url,
+                headers=headers, data=self.rpc['body'].encode() if stage == 'rpc' else None,
+                timeout=25, allow_redirects=False, accept_encoding='', max_recv_speed=2*1024*1024)
+            try:
                 raw = response.content
+                if len(raw) > 10*1024*1024:
+                    raise StopExperiment('response_size_limit')
                 mime = response.headers.get('content-type', '').split(';')[0].strip().lower()
                 record.update(status=response.status_code, mime=mime, bytes=len(raw),
-                    body_sha256=digest(raw), wire_header_names=sorted(wire_names),
-                    wire_absent=omitted.lower() not in wire_names if omitted else None,
-                    retry_after_present='retry-after' in response.headers)
-                if stage_name == 'rpc' and response.status_code == 200:
+                    body_sha256=digest(raw), wire_header_names=sorted(self.wire_names),
+                    wire_absent=omitted not in self.wire_names if omitted else None,
+                    response_cookie_names=sorted({c.name for c in response.cookies.jar}))
+                next_url = None
+                if response.status_code == 200 and stage == 'rpc':
                     try:
                         next_url = self.parse_rpc(response.text)
-                        self.valid_url(next_url)
                     except ValueError:
                         pass
-                elif stage_name != 'final' and response.status_code == 200 and mime == 'text/plain':
+                elif response.status_code == 200 and stage != 'final' and mime == 'text/plain':
                     text = raw.decode('utf-8', errors='replace').strip()
                     if len(text) <= 8192 and text.startswith('https://'):
-                        self.valid_url(text)
                         next_url = text
-                if next_url:
-                    record['returned_url_host'] = urlsplit(next_url).hostname
-                    record['returned_url_path_len'] = len(urlsplit(next_url).path)
-                if stage_name == 'final':
+                if stage == 'final':
                     record['dimensions'] = jpeg_size(raw)
-                    record['semantic_success'] = (response.status_code == 200 and mime == 'image/jpeg'
-                        and digest(raw) == self.baseline_sha and record['dimensions'] == [2816, 1536])
+                    success = (response.status_code == 200 and mime == 'image/jpeg'
+                        and digest(raw) == self.args.image_sha256 and record['dimensions'] == [2816,1536])
                 else:
-                    record['semantic_success'] = next_url is not None
-                # Do not retain JPEGs repeatedly; keep bounded diagnostic response bodies.
+                    success = next_url is not None
+                record['stage_success'] = success
                 if not mime.startswith('image/'):
                     (self.root / f'{self.seq:04d}-body').write_bytes(raw[:16384])
+                if (response.status_code in (429,503) or 'retry-after' in response.headers
+                        or (not mime.startswith('image/') and any(t in raw.lower() for t in
+                            (b'unusual traffic', b'recaptcha', b'cf-chl-', b'captcha challenge')))):
+                    raise StopExperiment('rate_limit_or_challenge')
+                if not self.wire_names:
+                    raise StopExperiment('outgoing_header_capture_missing')
+                if omitted and not record['wire_absent']:
+                    raise StopExperiment('removed_header_was_resent')
+                return success, next_url
+            finally:
                 response.close()
         except StopExperiment:
             raise
         except Exception as exc:
-            record.update(exception_type=type(exc).__name__, status=None, semantic_success=False,
-                wire_absent=omitted.lower() not in wire_names if omitted and wire_names else None)
+            record['exception_type'] = type(exc).__name__
+            raise StopExperiment('transport_error_' + type(exc).__name__) from None
         finally:
-            # Pace from completion, so even slow calls cannot produce bursts.
-            self.last_request = time.monotonic()
-        self.records.append(record)
-        with (self.root / 'requests.jsonl').open('a') as stream:
-            stream.write(json.dumps(record) + '\n')
-        self.publish()
-        print(json.dumps(record), flush=True)
-        lower = raw.lower()
-        if (record.get('status') in (429, 503) or record.get('retry_after_present')
-                or any(token in lower for token in (b'unusual traffic', b'recaptcha', b'cf-chl-', b'captcha challenge'))):
-            raise StopExperiment('rate_limit_or_challenge')
-        if not wire_names:
-            raise StopExperiment('outgoing_header_capture_missing')
-        if omitted and not record.get('wire_absent'):
-            raise StopExperiment('removed_header_was_resent')
-        return record, next_url
-
-    def control(self, stage):
-        record, url = self.request(stage, control=True)
-        if not record['semantic_success']:
-            raise StopExperiment('positive_control_failed_' + stage)
-        return url
-
-    def establish_chain(self):
-        rpc_headers = {k.lower(): v for k, v in self.rpc['headers'].items()}
-        rpc_headers['cookie'] = self.cookie
-        self.stages['rpc'] = {'url': self.rpc['url'], 'method': 'POST', 'headers': rpc_headers,
-                              'body': self.rpc['body'].encode('utf-8')}
-        source = self.control('rpc')
-        self.stages['source'] = {'url': initial_media_url(source), 'method': 'GET',
-                                  'headers': {k.lower(): v for k, v in self.profiles['media'].items()}}
-        mediator = self.control('source')
-        # Only this exact Google-domain allowlist may receive login cookies.
-        if urlsplit(mediator).hostname not in {'lh3.google.com', 'work.fife.usercontent.google.com'}:
-            raise StopExperiment('unexpected_authenticated_mediator_host')
-        mediator_headers = {k.lower(): v for k, v in self.profiles['mediator'].items()}
-        mediator_headers['cookie'] = self.cookie
-        self.stages['mediator'] = {'url': mediator, 'method': 'GET', 'headers': mediator_headers}
-        final = self.control('mediator')
-        self.stages['final'] = {'url': final, 'method': 'GET',
-                                 'headers': {k.lower(): v for k, v in self.profiles['media'].items()}}
-        self.control('final')
-        # Signed URLs remain private, account Cookie is not written to disk.
-        write_json(self.root / 'baseline-urls.json', {k: v['url'] for k, v in self.stages.items()})
-        self.status = 'running'
-        self.publish()
-
-    def run_stage(self, name):
-        self.status = 'running_' + name
-        names = sorted(self.stages[name]['headers'])
-        self.rng.shuffle(names)
-        if 'cookie' in names:
-            names.remove('cookie')
-            names.insert(0, 'cookie')
-        for offset in range(0, len(names), self.args.group_size):
-            group = names[offset:offset + self.args.group_size]
-            self.control(name)
-            added = []
-            for omitted in group:
-                record, _ = self.request(name, omitted)
-                row = {'stage': name, 'removed_header': omitted,
-                       'wire_absent': record.get('wire_absent'), 'status': record.get('status'),
-                       'semantic_success': record['semantic_success'], 'classification': 'awaiting_control',
-                       'request_seq': record['seq']}
-                self.rows.append(row); added.append(row); self.publish()
-            self.control(name)
-            for row in added:
-                row['classification'] = ('removal_passed_this_sample' if row['semantic_success']
-                                         else 'removal_failed_between_healthy_controls')
+            if saved_cookies is not None:
+                saved_cookies.update(self.session.cookies)
+                self.session.cookies = saved_cookies
+            self.records.append(record)
+            with (self.root / 'requests.jsonl').open('a') as stream:
+                stream.write(json.dumps(record) + '\n')
             self.publish()
+            print(json.dumps(record), flush=True)
+
+    def case(self, omitted=None, scope='chain'):
+        self.wait()
+        self.case_id += 1
+        self.status = 'running_case'
+        url = self.rpc['url']
+        try:
+            for stage in self.stages:
+                if (self.root / 'STOP').exists():
+                    raise StopExperiment('operator_stop_file')
+                remove = omitted if scope in ('chain',stage) else None
+                success, next_url = self.request(stage, url, remove)
+                if not success:
+                    return False, stage
+                if stage != 'final':
+                    url = initial_media_url(next_url) if stage == 'rpc' else next_url
+            return True, ''
+        finally:
+            self.last_case_end = time.monotonic()
+            self.publish()
+
+    def control(self):
+        success, failed_stage = self.case()
+        if not success:
+            raise StopExperiment('positive_control_failed_' + failed_stage)
+
+    def group(self, cases):
+        rows = []
+        for scope, field in cases:
+            success, failed_stage = self.case(field, scope)
+            row = {'scope':scope, 'removed_header':field, 'case_id':self.case_id,
+                   'jpeg_verified':success, 'first_failed_stage':failed_stage,
+                   'classification':'awaiting_control'}
+            self.rows.append(row)
+            rows.append(row)
+            self.publish()
+        self.control()
+        for row in rows:
+            row['classification'] = ('removal_passed_this_sample' if row['jpeg_verified']
+                                     else 'removal_failed_between_healthy_controls')
+        self.publish()
 
     def run(self):
         try:
-            self.establish_chain()
-            # Highest-value authenticated intermediary first.
-            for name in ['mediator', 'rpc', 'source', 'final']:
-                self.run_stage(name)
-            self.control('final')
+            self.control()
+            fields = list(self.fields)
+            self.rng.shuffle(fields)
+            if 'cookie' in fields:
+                fields.remove('cookie')
+                fields.insert(0,'cookie')
+            for start in range(0,len(fields),self.args.group_size):
+                self.group([('chain',field) for field in fields[start:start+self.args.group_size]])
+            failed = [row['removed_header'] for row in self.rows
+                      if row['scope']=='chain' and not row['jpeg_verified']]
+            isolates = [(stage,field) for field in failed for stage in self.stages
+                        if field in self.headers[stage]]
+            for start in range(0,len(isolates),self.args.group_size):
+                self.group(isolates[start:start+self.args.group_size])
             self.status = 'completed'
         except StopExperiment as exc:
             self.status = 'stopped_' + str(exc)
         except Exception as exc:
             self.status = 'stopped_exception_' + type(exc).__name__
         finally:
+            self.session.close()
             self.publish()
-            print(json.dumps({'status': self.status, 'requests': self.seq,
-                'completed_ablations': len(self.rows), 'output': str(self.root)}), flush=True)
+            print(json.dumps({'status':self.status,'requests':self.seq,
+                'completed_ablations':len(self.rows),'output':str(self.root)}),flush=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--rpc-input', required=True)
-    parser.add_argument('--media-headers', required=True)
-    parser.add_argument('--har', default='gemini.google.com3.har')
-    parser.add_argument('--config', required=True)
-    parser.add_argument('--package-root', required=True)
-    parser.add_argument('--output', required=True)
-    parser.add_argument('--interval', type=float, default=45)
-    parser.add_argument('--group-size', type=int, default=5)
-    parser.add_argument('--image-sha256', default='673a7253133214e00edd8421cb5261ddb17dd7f2f3ea65cc74a5c6c9a3adba39')
+    parser.add_argument('--rpc-input',required=True)
+    parser.add_argument('--media-headers',required=True)
+    parser.add_argument('--har',default='gemini.google.com3.har')
+    parser.add_argument('--config',required=True)
+    parser.add_argument('--package-root',required=True)
+    parser.add_argument('--output',required=True)
+    parser.add_argument('--interval',type=float,default=180)
+    parser.add_argument('--group-size',type=int,default=5)
+    parser.add_argument('--image-sha256',default='673a7253133214e00edd8421cb5261ddb17dd7f2f3ea65cc74a5c6c9a3adba39')
     args = parser.parse_args()
-    if args.interval < 30:
-        parser.error('interval must be at least 30 seconds')
+    if args.interval < 180:
+        parser.error('case interval must be at least 180 seconds')
     if not 1 <= args.group_size <= 5:
         parser.error('group size must be 1..5')
     os.umask(0o077)
-    # Hold one local lock across runs to prevent accidental concurrent probes.
     import fcntl
     lock_dir = Path(args.output).parent.parent
-    lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with (lock_dir / 'header-ablation.lock').open('a') as lock:
+    lock_dir.mkdir(mode=0o700,parents=True,exist_ok=True)
+    with (lock_dir/'header-ablation.lock').open('a') as lock:
         try:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(lock.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
         except BlockingIOError:
             parser.error('another header ablation is already running')
         Experiment(args).run()
