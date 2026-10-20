@@ -128,8 +128,9 @@ class Experiment:
             'credential_policy': 'read current service Cookie after cooldown before each case; log its hash only',
             'rpc_body_sha256': digest(self.rpc['body'].encode()),
             'expected_image_sha256': args.image_sha256,
+            'accepted_reference_hashes': args.image_sha256,
             'new_generation': False, 'egress': 'panel2_direct',
-            'fields': self.fields, 'scope': 'necessity in this account/session only',
+            'fields': self.fields, 'skipped_fields': args.skip_fields, 'scope': 'necessity in this account/session only',
             'wire_absence_checked': True, 'case_success': 'exact known JPEG bytes and dimensions',
             'session_scope': 'fresh Session and empty response Cookie jar per case; shared only within its media chain',
             'media_cookies': 'explicit login Cookie only on exact Google mediator allowlist',
@@ -232,7 +233,7 @@ class Experiment:
                 if stage == 'final':
                     record['dimensions'] = jpeg_size(raw)
                     success = (response.status_code == 200 and mime == 'image/jpeg'
-                        and digest(raw) == self.args.image_sha256 and record['dimensions'] == [2816,1536])
+                        and digest(raw) in self.args.image_sha256 and record['dimensions'] == [2816,1536])
                 else:
                     success = next_url is not None
                 record['stage_success'] = success
@@ -318,7 +319,7 @@ class Experiment:
     def run(self):
         try:
             self.control()
-            fields = list(self.fields)
+            fields = [field for field in self.fields if field not in self.args.skip_fields]
             self.rng.shuffle(fields)
             if 'cookie' in fields:
                 fields.remove('cookie')
@@ -360,8 +361,14 @@ def main():
     parser.add_argument('--output',required=True)
     parser.add_argument('--interval',type=float,default=180)
     parser.add_argument('--group-size',type=int,default=1)
-    parser.add_argument('--image-sha256',default='673a7253133214e00edd8421cb5261ddb17dd7f2f3ea65cc74a5c6c9a3adba39')
+    parser.add_argument('--skip-field', action='append', dest='skip_fields', default=[])
+    parser.add_argument('--image-sha256',action='append',dest='image_sha256',default=None)
     args = parser.parse_args()
+    if args.image_sha256 is None:
+        args.image_sha256 = [
+            '673a7253133214e00edd8421cb5261ddb17dd7f2f3ea65cc74a5c6c9a3adba39',
+            '887cb010437b81a09a7deeefee54af8ea3570871db0e5f98551fc5096097b236',
+        ]
     if args.interval < 180:
         parser.error('case interval must be at least 180 seconds')
     if not 1 <= args.group_size <= 5:

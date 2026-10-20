@@ -17,7 +17,7 @@ Input formats:
 - RPC input: array of `{ "har": "gemini.google.com3.har", "request": { "url": "...", "headers": { "name": "value" }, "body": "exact HAR postData.text" } }`.
 - Media headers: `{ "media": { "name": "value" }, "mediator": { "name": "value" } }`, copied from HAR3 entries 317 and 318.
 
-The default known-image SHA256 and dimensions refer to the successful HAR3 replay: JPEG 2816 x 1536. Adjust image validation before applying to another image.
+The default known-image validation accepts the two already verified HAR3 JPEG variants: 2816 x 1536 with SHA256 `673a7253...` or `887cb010...`. Add `--image-sha256 HASH` to append another independently verified variant; use `--skip-field NAME` to resume after a confirmed field without retesting it. Skipped fields are recorded in the manifest and are not treated as newly tested.
 
 ## Method
 
@@ -44,4 +44,4 @@ The experiment covers HAR-exported headers plus the added Cookie. HTTP/2 pseudoh
 
 Directories use 0700 and files 0600. Do not publish raw response bodies or private HAR input files. Cookie values are never written to experiment results.
 
-For 34 fields and the default one-removal-per-control policy, the initial screen takes approximately 3.5 hours at three minutes per case (34 removals and 35 complete controls). Subsequent stage isolation adds three minutes per case and control. Failed removals may end their chain early but still receive the full cooldown. The runner does not resume or retry automatically.
+For 34 fields and the default one-removal-per-control policy, the initial screen takes approximately 3.5 hours at three minutes per case (34 removals and 35 complete controls). Use `--skip-field` for already confirmed fields when resuming. Subsequent stage isolation adds three minutes per case and control. Failed removals may end their chain early but still receive the full cooldown. The runner does not resume or retry automatically.
