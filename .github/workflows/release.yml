@@ -1,0 +1,76 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  serv00:
+    name: Build Serv00 native release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build FreeBSD amd64 wheelhouse and release archive
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: 14.3
+          arch: x86_64
+          prepare: |
+            pkg install -y python311
+          run: |
+            set -eu
+            version=$(python3.11 -c 'import runpy; print(runpy.run_path("gemini_web2api/__init__.py")["__version__"])')
+            test "v$version" = "$GITHUB_REF_NAME"
+            python3.11 -m venv .release-venv
+            .release-venv/bin/python -m pip install --upgrade pip
+            mkdir -p runtime-build/wheelhouse
+            .release-venv/bin/python -m pip wheel --wheel-dir runtime-build/wheelhouse -r requirements.txt
+            .release-venv/bin/python deploy/serv00/build-image-runtime.py --build-root runtime-build
+            PYTHON=.release-venv/bin/python sh deploy/serv00/build-images.sh \
+              runtime-build/wheelhouse \
+              "gemini-web2api-serv00-v${version}-freebsd14.3-amd64-py311.tar.gz"
+            sha256 -q "gemini-web2api-serv00-v${version}-freebsd14.3-amd64-py311.tar.gz" \
+              > "gemini-web2api-serv00-v${version}-freebsd14.3-amd64-py311.tar.gz.sha256"
+            test -s "gemini-web2api-serv00-v${version}-freebsd14.3-amd64-py311.tar.gz"
+            test -s "gemini-web2api-serv00-v${version}-freebsd14.3-amd64-py311.tar.gz.sha256"
+            tar -tzf "gemini-web2api-serv00-v${version}-freebsd14.3-amd64-py311.tar.gz" \
+              | grep -q '^gemini-web2api/release.json$'
+
+      - name: Upload Serv00 release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: serv00-release-${{ github.ref_name }}
+          path: |
+            gemini-web2api-serv00-v*-freebsd14.3-amd64-py311.tar.gz
+            gemini-web2api-serv00-v*-freebsd14.3-amd64-py311.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  github-release:
+    name: Publish GitHub release
+    needs: serv00
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Serv00 release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: serv00-release-${{ github.ref_name }}
+          path: release-assets
+
+      - name: Publish release and Serv00 assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "gemini-web2api ${GITHUB_REF_NAME#v}" \
+            --generate-notes \
+            release-assets/*
