@@ -77,14 +77,13 @@ def _generated_image_payload(image, response_format: str):
     last_error = None
     for index, (source_kind, source_url) in enumerate(candidates):
         try:
+            import base64
+            image_bytes, mime = download_generated_image(source_url)
+            encoded = base64.b64encode(image_bytes).decode("ascii")
             if response_format == "url":
-                # The caller may have a browser-side proxy that can access the
-                # signed Gemini delivery chain; keep the raw source URL intact.
-                data = {"url": source_url}
+                data = {"url": "data:%s;base64,%s" % (mime, encoded)}
             else:
-                import base64
-                image_bytes, _mime = download_generated_image(source_url)
-                data = {"b64_json": base64.b64encode(image_bytes).decode("ascii")}
+                data = {"b64_json": encoded}
             return data, source_kind, source_url
         except Exception as exc:
             last_error = exc

@@ -446,7 +446,9 @@ The Responses API also accepts `{"type": "image_generation"}` in `tools` and ret
 requests such as `generate an image of ...` and returns a Markdown image URL.
 
 Generated image URLs are restricted to validated Google image hosts, with bounded redirects,
-size limits, and image signature checks.
+size limits, and image signature checks. The server performs the authenticated media download
+for both response formats: `b64_json` contains image bytes, while `url` contains a server-owned
+`data:image/...;base64,...` URL and never exposes a signed Gemini delivery URL to clients.
 
 ## Limitations
 
