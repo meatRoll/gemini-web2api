@@ -25,6 +25,7 @@ jobs:
             pkg install -y python311 git-lite
           run: |
             set -eu
+            git config --global --add safe.directory "$GITHUB_WORKSPACE"
             version=$(python3.11 -c 'import runpy; print(runpy.run_path("gemini_web2api/__init__.py")["__version__"])')
             test "v$version" = "$GITHUB_REF_NAME"
             python3.11 -m venv .release-venv
