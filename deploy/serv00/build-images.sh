@@ -23,7 +23,8 @@ cp "$root/deploy/serv00/build-image-runtime.py" "$release/build-image-runtime.py
 cp "$root/deploy/serv00/config.production.example.json" "$release/config.example.json"
 cp "$root/deploy/serv00/RELEASE_NOTES.md" "$release/RELEASE_NOTES.md"
 cp "$root/LICENSE" "$release/LICENSE"
-python3 - "$root" "$release" <<'PY'
+python_bin=${PYTHON:-python3}
+"$python_bin" - "$root" "$release" <<'PY'
 import hashlib, json, runpy, subprocess, sys
 from pathlib import Path
 root, release = map(Path, sys.argv[1:])
