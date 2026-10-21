@@ -5,7 +5,7 @@ There are two native FreeBSD release archives. Neither requires Docker or root a
 - `gemini-web2api-serv00.tar.gz`: application source for text serving; install dependencies from PyPI.
 - `gemini-web2api-serv00-images.tar.gz`: application source plus a complete offline wheelhouse for **FreeBSD 14.3 amd64 / Python 3.11**, including Chrome image transport. Use this release for image input. Stable releases can be named `gemini-web2api-serv00-v1.1.2-freebsd14.3-amd64-py311.tar.gz`.
 
-The stable 1.1.2 release includes a production `config.example.json`, a separate test template, [release notes](RELEASE_NOTES.md), and file/dependency SHA256 manifests. The health endpoint and `python -m gemini_web2api --version` report the application version; `release.json` records the exact source commit and stable channel. Deploy it to the directory and port used by your existing tunnel/client so they reach the upgraded service.
+The formal `v1.1.2` release is built by GitHub Actions. A tag push produces the multi-architecture GHCR image (`ghcr.io/meatroll/gemini-web2api:v1.1.2`) and attaches the FreeBSD native archive (`gemini-web2api-serv00-v1.1.2-freebsd14.3-amd64-py311.tar.gz`) plus its SHA256 file to the GitHub Release. Future releases use the same `vX.Y.Z` tag convention.
 
 For a new production installation:
 
