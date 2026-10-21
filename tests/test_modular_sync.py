@@ -628,13 +628,17 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(headers["Referer"], "https://gemini.google.com/")
         self.assertEqual(headers["Sec-Fetch-Site"], "same-origin")
         from gemini_web2api.generated_image import _request_args
-        download_headers = _request_args(stream=True)["headers"]
-        self.assertEqual(
-            {key.lower(): value for key, value in download_headers.items()
-             if key.lower() in expected},
-            expected,
-        )
-        self.assertEqual(download_headers["User-Agent"], CONFIG["google_user_agent"])
+        with mock.patch("gemini_web2api.gemini.load_cookie", return_value=("SID=private", "sapisid")):
+            mediator_args = _request_args(
+                stream=True, url="https://lh3.google.com/rd-gg/mediator"
+            )
+            final_args = _request_args(
+                stream=True, url="https://lh3.googleusercontent.com/rd-gg/final"
+            )
+        self.assertEqual(mediator_args["headers"], {"Cookie": "SID=private"})
+        self.assertEqual(final_args["headers"], {})
+        self.assertFalse(mediator_args["default_headers"])
+        self.assertFalse(final_args["default_headers"])
 
     def test_full_size_payload_reserializes_response_context_as_sparse_jspb(self):
         from gemini_web2api.generated_image import GeneratedImage
@@ -722,10 +726,13 @@ class StreamingEndpointTests(unittest.TestCase):
         ])
         generate_image_structured.assert_called_once_with("a red fox")
 
-    @mock.patch("gemini_web2api.server.download_generated_image")
+    @mock.patch(
+        "gemini_web2api.server.download_generated_image",
+        return_value=(b"\x89PNG\r\n\x1a\n", "image/png"),
+    )
     @mock.patch("gemini_web2api.server.get_full_size_image", return_value="https://lh3.googleusercontent.com/raw")
     @mock.patch("gemini_web2api.server.generate_image_structured")
-    def test_image_generation_url_returns_raw_source_for_local_download(
+    def test_image_generation_url_returns_server_owned_data_url(
         self, generate_image_structured, _full_size, download_generated_image
     ):
         from gemini_web2api.generated_image import GeneratedImage, GenerationResult
@@ -736,8 +743,10 @@ class StreamingEndpointTests(unittest.TestCase):
             "prompt": "a red fox", "response_format": "url",
         })
         self.assertEqual(status, 200)
-        self.assertEqual(json.loads(body)["data"][0]["url"], "https://lh3.googleusercontent.com/raw")
-        download_generated_image.assert_not_called()
+        returned_url = json.loads(body)["data"][0]["url"]
+        self.assertTrue(returned_url.startswith("data:image/png;base64,"))
+        self.assertNotIn("googleusercontent.com", returned_url)
+        download_generated_image.assert_called_once_with("https://lh3.googleusercontent.com/raw")
 
 
     @mock.patch("gemini_web2api.server.download_generated_image", return_value=(b"\x89PNG\r\n\x1a\n", "image/png"))

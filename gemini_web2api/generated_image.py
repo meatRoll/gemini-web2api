@@ -373,40 +373,24 @@ def _limits() -> tuple[int, int]:
     return max_bytes, max_redirects
 
 
-def _request_args(stream: bool) -> dict:
-    browser_headers = {
-        "x-browser-channel": "stable",
-        "x-browser-copyright": "Copyright 2026 Google LLC. All Rights Reserved.",
-        "x-browser-validation": "YXjt/if5gRhK4M5qXvb22nUeBck=",
-        "x-browser-year": "2026",
-        "x-client-data": "CKmdygEIlaHLAQiGoM0B",
-    }
-    configured = CONFIG.get("google_browser_headers")
-    if isinstance(configured, dict):
-        browser_headers.update({key: value for key, value in configured.items()
-                                if key in browser_headers and isinstance(value, str) and value})
-    user_agent = CONFIG.get("google_user_agent")
-    if not isinstance(user_agent, str) or not user_agent:
-        user_agent = (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36"
-        )
+def _request_args(stream: bool, url: str | None = None) -> dict:
+    """Build the minimal media request with host-scoped login Cookie."""
+    headers = {}
+    if url:
+        host = (urlsplit(url).hostname or "").lower()
+        if host in _MEDIATOR_GENERATED_IMAGE_HOSTS:
+            try:
+                from .gemini import load_cookie
+                cookie, _ = load_cookie()
+            except Exception:
+                cookie = ""
+            if cookie:
+                headers["Cookie"] = cookie
     args = {
-        "headers": {
-            "Accept": "*/*",
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,ja;q=0.7",
-            "Cache-Control": "no-cache",
-            "Origin": "https://gemini.google.com",
-            "Pragma": "no-cache",
-            "Referer": "https://gemini.google.com/",
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "cross-site",
-            "User-Agent": user_agent,
-            **browser_headers,
-        },
+        "headers": headers,
         "timeout": CONFIG["request_timeout_sec"],
         "impersonate": "chrome",
+        "default_headers": False,
         "allow_redirects": False,
         "stream": stream,
     }
@@ -462,7 +446,7 @@ def resolve_generated_image_url(url: str) -> str:
     while True:
         _diagnostic_log("resolve_request hop=%s mediator=%s %s" % (
             redirects, current_is_mediator, _url_debug(current)))
-        response = curl_requests.get(current, **_request_args(stream=True))
+        response = curl_requests.get(current, **_request_args(stream=True, url=current))
         try:
             _diagnostic_log("resolve_response hop=%s %s %s" % (
                 redirects, _url_debug(current), _response_debug(response)))
@@ -505,7 +489,7 @@ def download_generated_image(url: str) -> tuple[bytes, str]:
     current = final_url
     for hop in range(max_redirects + 1):
         _diagnostic_log("download_request hop=%s %s" % (hop, _url_debug(current)))
-        response = curl_requests.get(current, **_request_args(stream=True))
+        response = curl_requests.get(current, **_request_args(stream=True, url=current))
         try:
             _diagnostic_log("download_response hop=%s %s %s" % (
                 hop, _url_debug(current), _response_debug(response)))

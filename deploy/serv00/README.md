@@ -3,15 +3,15 @@
 There are two native FreeBSD release archives. Neither requires Docker or root access, and neither includes cookies, credentials, or private configuration.
 
 - `gemini-web2api-serv00.tar.gz`: application source for text serving; install dependencies from PyPI.
-- `gemini-web2api-serv00-images.tar.gz`: application source plus a complete offline wheelhouse for **FreeBSD 14.3 amd64 / Python 3.11**, including Chrome image transport. Use this release for image input. Stable releases can be named `gemini-web2api-serv00-v1.1.1-freebsd14.3-amd64-py311.tar.gz`.
+- `gemini-web2api-serv00-images.tar.gz`: application source plus a complete offline wheelhouse for **FreeBSD 14.3 amd64 / Python 3.11**, including Chrome image transport. Use this release for image input. Stable releases can be named `gemini-web2api-serv00-v1.1.2-freebsd14.3-amd64-py311.tar.gz`.
 
-The stable 1.1.1 release includes a production `config.example.json`, a separate test template, [release notes](RELEASE_NOTES.md), and file/dependency SHA256 manifests. The health endpoint and `python -m gemini_web2api --version` report the application version; `release.json` records the exact source commit and stable channel. Deploy it to the directory and port used by your existing tunnel/client so they reach the upgraded service.
+The stable 1.1.2 release includes a production `config.example.json`, a separate test template, [release notes](RELEASE_NOTES.md), and file/dependency SHA256 manifests. The health endpoint and `python -m gemini_web2api --version` report the application version; `release.json` records the exact source commit and stable channel. Deploy it to the directory and port used by your existing tunnel/client so they reach the upgraded service.
 
 For a new production installation:
 
 ```sh
 mkdir -p ~/gemini-web2api
-tar -xzf gemini-web2api-serv00-v1.1.1-freebsd14.3-amd64-py311.tar.gz -C ~/gemini-web2api --strip-components 1
+tar -xzf gemini-web2api-serv00-v1.1.2-freebsd14.3-amd64-py311.tar.gz -C ~/gemini-web2api --strip-components 1
 cd ~/gemini-web2api
 sh install.sh
 cp config.example.json config.json
