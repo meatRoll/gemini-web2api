@@ -22,7 +22,7 @@ jobs:
           release: 14.3
           arch: x86_64
           prepare: |
-            pkg install -y python311
+            pkg install -y python311 git-lite
           run: |
             set -eu
             version=$(python3.11 -c 'import runpy; print(runpy.run_path("gemini_web2api/__init__.py")["__version__"])')
