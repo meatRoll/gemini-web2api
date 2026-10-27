@@ -749,10 +749,104 @@ class StreamingEndpointTests(unittest.TestCase):
         download_generated_image.assert_called_once_with("https://lh3.googleusercontent.com/raw")
 
 
-    @mock.patch("gemini_web2api.server.download_generated_image", return_value=(b"\x89PNG\r\n\x1a\n", "image/png"))
+    def test_image_edit_endpoint_uploads_source_and_mask(self):
+        from gemini_web2api.generated_image import GeneratedImage, GenerationResult
+
+        generated = GenerationResult(
+            images=[GeneratedImage("https://lh3.googleusercontent.com/edited")]
+        )
+        source = b"\x89PNG\r\n\x1a\nsource"
+        mask = b"\x89PNG\r\n\x1a\nmask"
+        with mock.patch(
+            "gemini_web2api.server.upload_image",
+            side_effect=["/uploaded/source", "/uploaded/mask"],
+        ) as upload_image, mock.patch(
+            "gemini_web2api.server.generate_image_structured",
+            return_value=generated,
+        ) as generate_image_structured, mock.patch(
+            "gemini_web2api.server.get_full_size_image", return_value=None
+        ), mock.patch(
+            "gemini_web2api.server.download_generated_image",
+            return_value=(b"\x89PNG\r\n\x1a\n", "image/png"),
+        ):
+            status, _, body = self.post_multipart(
+                "/v1/images/edits",
+                fields={
+                    "prompt": "replace the sky with a sunset",
+                    "response_format": "b64_json",
+                    "n": "1",
+                    "model": "gpt-image-1",
+                },
+                files={
+                    "image": ("source.png", source, "image/png"),
+                    "mask": ("mask.png", mask, "image/png"),
+                },
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["data"][0]["b64_json"], "iVBORw0KGgo=")
+        self.assertEqual(upload_image.call_args_list, [
+            mock.call(source, "source.png", "image/png"),
+            mock.call(mask, "mask.png", "image/png"),
+        ])
+        generate_image_structured.assert_called_once()
+        prompt = generate_image_structured.call_args.args[0]
+        self.assertIn("replace the sky with a sunset", prompt)
+        self.assertIn("edit mask", prompt)
+        self.assertEqual(
+            generate_image_structured.call_args.kwargs["file_refs"],
+            [("/uploaded/source", "source.png"), ("/uploaded/mask", "mask.png")],
+        )
+
+    def test_image_edit_endpoint_rejects_invalid_multipart_requests(self):
+        status, _, body = self.post_multipart(
+            "/v1/images/edits", fields={"prompt": "edit this"}
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("image is required", json.loads(body)["error"]["message"])
+
+        status, _, body = self.post_multipart(
+            "/v1/images/edits",
+            fields={"prompt": "edit this", "n": "2"},
+            files={"image": ("source.png", b"fake", "image/png")},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("only n=1", json.loads(body)["error"]["message"])
+
+    @mock.patch("gemini_web2api.server.generate_image_structured")
+    def test_image_edit_endpoint_returns_server_owned_url_data(self, generate_image_structured):
+        from gemini_web2api.generated_image import GeneratedImage, GenerationResult
+        generate_image_structured.return_value = GenerationResult(
+            images=[GeneratedImage("https://lh3.googleusercontent.com/edited")]
+        )
+        with mock.patch(
+            "gemini_web2api.server.upload_image", return_value="/uploaded/source"
+        ), mock.patch(
+            "gemini_web2api.server.get_full_size_image", return_value=None
+        ), mock.patch(
+            "gemini_web2api.server.download_generated_image",
+            return_value=(b"\x89PNG\r\n\x1a\n", "image/png"),
+        ):
+            status, _, body = self.post_multipart(
+                "/v1/images/edits",
+                fields={"prompt": "make it brighter", "response_format": "url"},
+                files={"image": ("source.png", b"\x89PNG\r\n\x1a\nsource", "image/png")},
+            )
+
+        self.assertEqual(status, 200)
+        returned_url = json.loads(body)["data"][0]["url"]
+        self.assertTrue(returned_url.startswith("data:image/png;base64,"))
+        self.assertNotIn("googleusercontent.com", returned_url)
+
+    @mock.patch(
+        "gemini_web2api.server.download_generated_image",
+        return_value=(b"\x89PNG\r\n\x1a\n", "image/png"),
+    )
     @mock.patch("gemini_web2api.server.get_full_size_image", return_value=None)
     @mock.patch("gemini_web2api.server.generate_image_structured")
-    def test_responses_image_generation_returns_native_output(self, generate_image_structured, _full_size, _download):
+    def test_responses_image_generation_returns_native_output(
+        self, generate_image_structured, _full_size, _download
+    ):
         from gemini_web2api.generated_image import GeneratedImage, GenerationResult
         generate_image_structured.return_value = GenerationResult(
             images=[GeneratedImage("https://lh3.googleusercontent.com/generated")]
@@ -789,6 +883,37 @@ class StreamingEndpointTests(unittest.TestCase):
         headers = dict(response.getheaders())
         connection.close()
         return response.status, headers, body
+
+    def post_multipart(self, path, fields=None, files=None):
+        boundary = "------------------------edits-test-boundary"
+        body = bytearray()
+        for name, value in (fields or {}).items():
+            body.extend(f"--{boundary}\r\n".encode())
+            body.extend(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode())
+            body.extend(str(value).encode())
+            body.extend(b"\r\n")
+        for name, (filename, data, mime) in (files or {}).items():
+            body.extend(f"--{boundary}\r\n".encode())
+            body.extend(
+                f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'.encode()
+            )
+            body.extend(f"Content-Type: {mime}\r\n\r\n".encode())
+            body.extend(data)
+            body.extend(b"\r\n")
+        body.extend(f"--{boundary}--\r\n".encode())
+
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        connection.request(
+            "POST",
+            path,
+            body=bytes(body),
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        )
+        response = connection.getresponse()
+        result = response.read().decode()
+        headers = dict(response.getheaders())
+        connection.close()
+        return response.status, headers, result
 
     def post_chunked_json(self, path, payload):
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)

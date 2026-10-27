@@ -91,7 +91,36 @@ class AttachmentTransportTests(unittest.TestCase):
         headers.assert_called_once_with(request_uuid=request_uuid)
         model_headers.assert_called_once_with({"at": "token", "f_sid": "sid"}, request_uuid)
 
-    def test_text_and_legacy_attachments_remain_compatible(self):
+    def test_image_generation_reuses_uploaded_refs_in_request_body(self):
+        request_uuid = "11111111-2222-4333-8444-555555555555"
+        response = mock.MagicMock()
+        response.text = "image-result"
+        file_refs = [("/uploaded/source", "source.png"), ("/uploaded/mask", "mask.png")]
+        with mock.patch.object(gemini, "HAS_CURL_CFFI", True), \
+                mock.patch.object(gemini.uuid, "uuid4", return_value=request_uuid), \
+                mock.patch.object(multimodal, "_cached_page_tokens", return_value={"at": "token", "f_sid": "sid"}), \
+                mock.patch.object(gemini, "_build_image_payload", return_value="body") as payload, \
+                mock.patch.object(gemini, "_build_headers", return_value={}), \
+                mock.patch.object(gemini, "_image_model_headers", return_value={}), \
+                mock.patch.object(gemini, "_get_url", return_value="https://gemini.test/stream"), \
+                mock.patch.object(gemini, "curl_requests") as requests:
+            requests.post.return_value = response
+            result = gemini._generate_image_raw_with_curl("edit", file_refs=file_refs)
+        self.assertEqual(result, "image-result")
+        payload.assert_called_once_with(
+            "edit", request_uuid, xsrf_token="token", file_refs=file_refs
+        )
+
+        inner = _decode_payload(gemini._build_image_payload(
+            "edit the source", "REQUEST-UUID",
+            file_refs=[("/uploaded/source", "source.png"), ("/uploaded/mask", "mask.png")],
+        ))
+        self.assertEqual(
+            inner[0][3],
+            [[['/uploaded/source'], "source.png"], [['/uploaded/mask'], "mask.png"]],
+        )
+        self.assertEqual((len(inner), inner[79], inner[80]), (97, 6, 1))
+
         text = _decode_payload(gemini._build_payload("hello", 1, 4))
         self.assertEqual(len(text), 102)
         self.assertIsNone(text[80])
