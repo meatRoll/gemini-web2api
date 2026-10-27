@@ -10,6 +10,7 @@ cookie.json
 .DS_Store
 gemini-auth.json
 *.sqlite3
+.pi/
 *_freq.json
 gemini-models.json
 gemini-models.json.lock
