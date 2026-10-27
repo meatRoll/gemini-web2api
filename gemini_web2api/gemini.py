@@ -422,10 +422,12 @@ def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list 
     return urllib.parse.urlencode(params)
 
 
-def _build_image_payload(prompt: str, request_uuid: str, xsrf_token: str = None) -> str:
+def _build_image_payload(prompt: str, request_uuid: str, xsrf_token: str = None,
+                         file_refs: list = None) -> str:
     """Build the dedicated Gemini Web image-generation request body."""
     inner = [None] * 97
-    inner[0] = [prompt, 0, None, None, None, None, 0]
+    refs = [_normalise_file_ref(ref) for ref in file_refs] if file_refs else None
+    inner[0] = [prompt, 0, None, refs, None, None, 0]
     inner[1] = ["en"]
     inner[2] = ["", "", "", None, None, None, None, None, None, ""]
     inner[3] = "!" + secrets.token_urlsafe(1903)
@@ -624,7 +626,7 @@ def extract_response_text(raw: str) -> str:
     return clean_text(selected)
 
 
-def _generate_image_raw_with_curl(prompt: str) -> str:
+def _generate_image_raw_with_curl(prompt: str, file_refs: list = None) -> str:
     """Send the dedicated GUI-equivalent image-generation request via Chrome TLS."""
     if not HAS_CURL_CFFI:
         raise RuntimeError("curl_cffi is required for Gemini image generation")
@@ -632,7 +634,10 @@ def _generate_image_raw_with_curl(prompt: str) -> str:
     from .multimodal import _cached_page_tokens
     page_tokens = _cached_page_tokens(max_age=0)
     request_uuid = str(uuid.uuid4()).upper()
-    body = _build_image_payload(prompt, request_uuid, xsrf_token=page_tokens.get("at"))
+    payload_kwargs = {"xsrf_token": page_tokens.get("at")}
+    if file_refs:
+        payload_kwargs["file_refs"] = file_refs
+    body = _build_image_payload(prompt, request_uuid, **payload_kwargs)
     headers = _build_headers(request_uuid=request_uuid)
     headers.update(_image_model_headers(page_tokens, request_uuid))
     request_args = {
@@ -658,9 +663,11 @@ def _generate_image_raw_with_curl(prompt: str) -> str:
     raise last_err
 
 
-def generate_image_structured(prompt: str) -> GenerationResult:
-    """Generate an image with the GUI-specific payload and return rich metadata."""
-    return extract_generation_result(_generate_image_raw_with_curl(prompt), clean_text)
+def generate_image_structured(prompt: str, file_refs: list = None) -> GenerationResult:
+    """Generate an image and return rich metadata, optionally using attachments."""
+    raw = (_generate_image_raw_with_curl(prompt, file_refs=file_refs)
+           if file_refs else _generate_image_raw_with_curl(prompt))
+    return extract_generation_result(raw, clean_text)
 
 
 def _batch_response_url(raw: str) -> str:

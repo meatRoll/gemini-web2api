@@ -10,6 +10,8 @@ import socket
 import threading
 import queue
 from urllib.parse import urlsplit
+from email.parser import BytesParser
+from email.policy import default as email_policy
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
@@ -204,9 +206,12 @@ def _upload_images(images: list) -> list:
         return None
     file_refs = []
     for item in images:
-        if not (isinstance(item, tuple) and len(item) == 2):
+        if not (isinstance(item, (tuple, list)) and len(item) in (2, 3)):
             continue
-        data, mime = item
+        data, mime = item[:2]
+        filename = item[2] if len(item) == 3 else "image.png"
+        if not isinstance(filename, str) or not filename:
+            filename = "image.png"
         try:
             if isinstance(data, str):
                 data = fetch_image_bytes(data)
@@ -215,12 +220,101 @@ def _upload_images(images: list) -> list:
             if len(data) > 10 * 1024 * 1024:
                 raise RuntimeError("image exceeds 10 MiB size limit")
             mime = detect_image_mime(data, mime or "image/png")
-            filename = "image.png"
             ref = upload_image(data, filename, mime)
             file_refs.append((ref, filename))
         except Exception as e:
             raise RuntimeError(f"image upload failed: {safe_error_message(e)}") from e
     return file_refs if file_refs else None
+
+
+def _parse_multipart_form(body: bytes, content_type: str) -> dict:
+    """Parse a bounded multipart/form-data body without losing binary file bytes."""
+    if not isinstance(content_type, str) or not content_type.lower().startswith("multipart/form-data"):
+        raise ValueError("Content-Type must be multipart/form-data")
+    try:
+        header = content_type.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise ValueError("invalid multipart Content-Type") from exc
+    message = BytesParser(policy=email_policy).parsebytes(
+        b"Content-Type: " + header + b"\r\nMIME-Version: 1.0\r\n\r\n" + body
+    )
+    if not message.is_multipart():
+        raise ValueError("invalid multipart body")
+
+    fields = {}
+    for part in message.iter_parts():
+        if part.get_content_disposition() != "form-data":
+            raise ValueError("multipart parts must use form-data disposition")
+        name = part.get_param("name", header="content-disposition")
+        if not isinstance(name, str) or not name:
+            raise ValueError("multipart part is missing a field name")
+        value = part.get_payload(decode=True)
+        if value is None:
+            value = b""
+        fields.setdefault(name, []).append({
+            "data": value,
+            "filename": part.get_filename(),
+            "content_type": part.get_content_type(),
+        })
+    return fields
+
+
+def _multipart_text(fields: dict, name: str, required: bool = False) -> str:
+    parts = fields.get(name, [])
+    if len(parts) != 1:
+        if required:
+            raise ValueError(f"{name} is required")
+        raise ValueError(f"{name} must be provided at most once")
+    part = parts[0]
+    if part.get("filename") is not None:
+        raise ValueError(f"{name} must be a text field")
+    try:
+        value = part["data"].decode("utf-8")
+    except (AttributeError, UnicodeDecodeError) as exc:
+        raise ValueError(f"{name} must be valid UTF-8") from exc
+    if required and not value.strip():
+        raise ValueError(f"{name} must not be empty")
+    return value
+
+
+def _multipart_file(fields: dict, name: str, required: bool = False):
+    parts = fields.get(name, [])
+    if not parts:
+        if required:
+            raise ValueError(f"{name} is required")
+        return None
+    if len(parts) != 1:
+        raise ValueError(f"{name} must be provided at most once")
+    part = parts[0]
+    data = part.get("data")
+    if not isinstance(data, bytes) or not data:
+        raise ValueError(f"{name} must be a non-empty image file")
+    if len(data) > 10 * 1024 * 1024:
+        raise ValueError(f"{name} exceeds 10 MiB size limit")
+    filename = part.get("filename")
+    if not isinstance(filename, str) or not filename:
+        filename = "image.png" if name == "image" else "mask.png"
+    filename = filename.replace("\\", "/").rsplit("/", 1)[-1] or (
+        "image.png" if name == "image" else "mask.png"
+    )
+    declared_mime = part.get("content_type") or "image/png"
+    if ";" in declared_mime:
+        declared_mime = declared_mime.split(";", 1)[0].strip()
+    mime = detect_image_mime(data, declared_mime if declared_mime.startswith("image/") else "image/png")
+    if not isinstance(mime, str) or not mime.startswith("image/"):
+        raise ValueError(f"{name} must be an image file")
+    return data, mime, filename
+
+
+def _edit_prompt(prompt: str, has_mask: bool) -> str:
+    if not has_mask:
+        return prompt
+    return (
+        "Edit the first attached image according to the user's instruction below. "
+        "The second attached image is an edit mask: preserve the opaque area and make "
+        "the requested changes in the transparent area.\n\n"
+        + prompt
+    )
 
 
 _UPSTREAM_RESPONSE_STARTED = object()
@@ -514,6 +608,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self._handle_chat(body)
             elif self.path == "/v1/caches":
                 self._handle_cache_create(body)
+            elif self.path == "/v1/images/edits":
+                self._handle_image_edit(body)
             elif self.path == "/v1/images/generations":
                 self._handle_image_generation(body)
             elif self.path == "/v1/responses":
@@ -560,6 +656,80 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": "invalid ttl_seconds"}}, 400)
             return
         self.send_json({"object": "cache", **CACHE.create(messages, ttl)}, 201)
+
+    # ─── /v1/images/edits ─────────────────────────────────────────────────────
+
+    def _handle_image_edit(self, body: bytes):
+        allowed_fields = {
+            "prompt", "image", "mask", "model", "n", "response_format", "stream",
+            "size", "quality", "style", "background", "moderation", "output_format",
+            "output_compression", "input_fidelity", "user",
+        }
+        try:
+            fields = _parse_multipart_form(body, self.headers.get("Content-Type", ""))
+            unexpected = sorted(set(fields) - allowed_fields)
+            if unexpected:
+                raise ValueError("unexpected field: " + unexpected[0])
+            prompt = _multipart_text(fields, "prompt", required=True).strip()
+            image = _multipart_file(fields, "image", required=True)
+            mask = _multipart_file(fields, "mask")
+
+            if "stream" in fields:
+                raise ValueError("stream is not supported")
+            if "n" in fields:
+                n_value = _multipart_text(fields, "n").strip()
+                try:
+                    n = int(n_value)
+                except ValueError as exc:
+                    raise ValueError("n must be 1") from exc
+                if n != 1:
+                    raise ValueError("only n=1 is supported")
+            response_format = "b64_json"
+            if "response_format" in fields:
+                response_format = _multipart_text(fields, "response_format").strip()
+            if response_format not in ("b64_json", "url"):
+                raise ValueError("response_format must be b64_json or url")
+            if "model" in fields and not _multipart_text(fields, "model").strip():
+                raise ValueError("model must not be empty")
+            ignored_fields = sorted(
+                set(fields).intersection(allowed_fields - {
+                    "prompt", "image", "mask", "model", "n", "response_format", "stream"
+                })
+            )
+        except ValueError as exc:
+            self.send_json({"error": {"message": str(exc)}}, 400)
+            return
+
+        if ignored_fields:
+            log("image_edit_compat ignored_fields=%s" % ",".join(ignored_fields))
+        attachments = [image]
+        if mask is not None:
+            attachments.append(mask)
+        try:
+            file_refs = _upload_images(attachments)
+            result = generate_image_structured(
+                _edit_prompt(prompt, mask is not None), file_refs=file_refs
+            )
+            if not result.images:
+                raise RuntimeError("Gemini returned no generated image metadata")
+            data, source_kind, source_url = _generated_image_payload(
+                result.images[0], response_format
+            )
+            log(
+                "image_edit_result selected_full_size=%s response_format=%s source_host=%s source_path=%s"
+                % (
+                    source_kind == "full_size", response_format,
+                    (urlsplit(source_url).hostname or "-"),
+                    (urlsplit(source_url).path or "/"),
+                )
+            )
+        except RuntimeError as exc:
+            self.send_json({"error": {"message": f"upstream error: {safe_error_message(exc, 500)}"}}, 502)
+            return
+        except Exception as exc:
+            self.send_json({"error": {"message": f"upstream error: {safe_error_message(exc, 500)}"}}, 502)
+            return
+        self.send_json({"created": int(time.time()), "data": [data]})
 
     # ─── /v1/images/generations ───────────────────────────────────────────────
 

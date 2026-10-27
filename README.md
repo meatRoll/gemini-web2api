@@ -438,8 +438,25 @@ The modular server supports `POST /v1/images/generations` with `prompt`, `n: 1`,
 `response_format` set to `b64_json` or `url`. The image route uses Gemini Web's dedicated
 browser request shape and returns one OpenAI-compatible image result. It accepts common
 OpenAI Images options such as `size`, `quality`, `style`, and `background` for client
-compatibility; these options are currently ignored by the Gemini backend. `stream`, image
-editing, and multiple outputs are not supported.
+compatibility; these options are currently ignored by the Gemini backend. `stream` and
+multiple outputs are not supported.
+
+The modular server also supports `POST /v1/images/edits` with OpenAI's multipart form:
+`image` and `prompt` are required, `mask` is optional, and only `n: 1` is supported.
+The source image and mask are uploaded to Gemini and sent to its dedicated image route;
+when a mask is supplied, transparent mask areas are described as the editable region.
+Images are limited to 10 MiB each. `response_format` accepts `b64_json` or `url`, and
+`url` returns a server-owned data URL. Common options such as `size`, `quality`, and
+`input_fidelity` are accepted for client compatibility but currently ignored by Gemini.
+`stream` and multiple outputs are not supported.
+
+```bash
+curl http://localhost:8081/v1/images/edits \\
+  -H "Authorization: Bearer sk-your-key" \\
+  -F "image=@source.png" \\
+  -F "prompt=Replace the sky with a sunset" \\
+  -F "response_format=b64_json"
+```
 
 The Responses API also accepts `{"type": "image_generation"}` in `tools` and returns an
 `image_generation_call` containing base64 output. Chat Completions recognizes explicit
