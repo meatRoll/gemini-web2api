@@ -4,6 +4,7 @@ import ipaddress
 import json
 import re
 import socket
+import struct
 import threading
 import time
 import urllib.request
@@ -153,6 +154,164 @@ def detect_image_mime(image_bytes: bytes, fallback: str = "image/png") -> str:
         if brand in (b"heic", b"heix", b"hevc", b"hevx"):
             return "image/heic"
     return fallback
+
+
+def _png_info(image_bytes: bytes) -> dict:
+    """Return PNG dimensions and whether the image carries transparency."""
+    if not isinstance(image_bytes, bytes) or not image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise ValueError("invalid PNG image")
+    if len(image_bytes) < 33 or image_bytes[12:16] != b"IHDR":
+        raise ValueError("invalid PNG image")
+    if struct.unpack(">I", image_bytes[8:12])[0] != 13:
+        raise ValueError("invalid PNG image")
+    width, height = struct.unpack(">II", image_bytes[16:24])
+    bit_depth = image_bytes[24]
+    color_type = image_bytes[25]
+    if not width or not height or bit_depth not in (1, 2, 4, 8, 16):
+        raise ValueError("invalid PNG image")
+    if color_type not in (0, 2, 3, 4, 6):
+        raise ValueError("invalid PNG color type")
+
+    has_alpha = color_type in (4, 6)
+    offset = 8
+    has_iend = False
+    while offset + 12 <= len(image_bytes):
+        length = struct.unpack(">I", image_bytes[offset:offset + 4])[0]
+        end = offset + 12 + length
+        if end > len(image_bytes):
+            raise ValueError("invalid PNG image")
+        chunk_type = image_bytes[offset + 4:offset + 8]
+        if chunk_type == b"tRNS":
+            has_alpha = True
+        if chunk_type == b"IEND":
+            has_iend = True
+            break
+        offset = end
+    if not has_iend:
+        raise ValueError("invalid PNG image")
+    return {"width": width, "height": height, "has_alpha": has_alpha}
+
+
+def _jpeg_dimensions(image_bytes: bytes) -> tuple:
+    """Read JPEG dimensions without requiring an image-processing dependency."""
+    if not isinstance(image_bytes, bytes) or not image_bytes.startswith(b"\xff\xd8"):
+        raise ValueError("invalid JPEG image")
+    sof_markers = set(range(0xC0, 0xC4)) | set(range(0xC5, 0xC8))
+    sof_markers |= set(range(0xC9, 0xCC)) | set(range(0xCD, 0xD0))
+    offset = 2
+    while offset + 1 < len(image_bytes):
+        if image_bytes[offset] != 0xFF:
+            raise ValueError("invalid JPEG image")
+        while offset < len(image_bytes) and image_bytes[offset] == 0xFF:
+            offset += 1
+        if offset >= len(image_bytes):
+            break
+        marker = image_bytes[offset]
+        offset += 1
+        if marker == 0x00:
+            continue
+        if marker == 0xD9:
+            break
+        if marker == 0xDA:
+            break
+        if marker == 0x01 or 0xD0 <= marker <= 0xD8:
+            continue
+        if offset + 2 > len(image_bytes):
+            raise ValueError("invalid JPEG image")
+        segment_length = struct.unpack(">H", image_bytes[offset:offset + 2])[0]
+        if segment_length < 2 or offset + segment_length > len(image_bytes):
+            raise ValueError("invalid JPEG image")
+        if marker in sof_markers:
+            if segment_length < 7:
+                raise ValueError("invalid JPEG image")
+            height = struct.unpack(">H", image_bytes[offset + 3:offset + 5])[0]
+            width = struct.unpack(">H", image_bytes[offset + 5:offset + 7])[0]
+            if not width or not height:
+                raise ValueError("invalid JPEG image")
+            return width, height
+        offset += segment_length
+    raise ValueError("JPEG dimensions are unavailable")
+
+
+def _gif_dimensions(image_bytes: bytes) -> tuple:
+    if not isinstance(image_bytes, bytes) or image_bytes[:6] not in (b"GIF87a", b"GIF89a"):
+        raise ValueError("invalid GIF image")
+    if len(image_bytes) < 10:
+        raise ValueError("invalid GIF image")
+    width, height = struct.unpack("<HH", image_bytes[6:10])
+    if not width or not height:
+        raise ValueError("invalid GIF image")
+    return width, height
+
+
+def _bmp_dimensions(image_bytes: bytes) -> tuple:
+    if not isinstance(image_bytes, bytes) or not image_bytes.startswith(b"BM") or len(image_bytes) < 26:
+        raise ValueError("invalid BMP image")
+    width, height = struct.unpack("<ii", image_bytes[18:26])
+    if not width or not height:
+        raise ValueError("invalid BMP image")
+    return abs(width), abs(height)
+
+
+def _webp_dimensions(image_bytes: bytes) -> tuple:
+    if (not isinstance(image_bytes, bytes) or len(image_bytes) < 30
+            or image_bytes[:4] != b"RIFF" or image_bytes[8:12] != b"WEBP"):
+        raise ValueError("invalid WebP image")
+    offset = 12
+    while offset + 8 <= len(image_bytes):
+        chunk_type = image_bytes[offset:offset + 4]
+        chunk_length = int.from_bytes(image_bytes[offset + 4:offset + 8], "little")
+        payload = offset + 8
+        end = payload + chunk_length
+        if end > len(image_bytes):
+            raise ValueError("invalid WebP image")
+        if chunk_type == b"VP8X" and chunk_length >= 10:
+            width = 1 + int.from_bytes(image_bytes[payload + 4:payload + 7], "little")
+            height = 1 + int.from_bytes(image_bytes[payload + 7:payload + 10], "little")
+            return width, height
+        if chunk_type == b"VP8 " and chunk_length >= 10:
+            frame = image_bytes.find(b"\x9d\x01\x2a", payload, end)
+            if frame >= 0 and frame + 7 <= end:
+                width = int.from_bytes(image_bytes[frame + 3:frame + 5], "little") & 0x3FFF
+                height = int.from_bytes(image_bytes[frame + 5:frame + 7], "little") & 0x3FFF
+                if width and height:
+                    return width, height
+        if chunk_type == b"VP8L" and chunk_length >= 5 and image_bytes[payload] == 0x2F:
+            bits = int.from_bytes(image_bytes[payload + 1:payload + 5], "little")
+            width = (bits & 0x3FFF) + 1
+            height = ((bits >> 14) & 0x3FFF) + 1
+            return width, height
+        offset = end + (chunk_length & 1)
+    raise ValueError("WebP dimensions are unavailable")
+
+
+def image_dimensions(image_bytes: bytes) -> tuple:
+    """Return dimensions for common raster formats used by image editing."""
+    mime = detect_image_mime(image_bytes, "")
+    if mime == "image/png":
+        info = _png_info(image_bytes)
+        return info["width"], info["height"]
+    if mime == "image/jpeg":
+        return _jpeg_dimensions(image_bytes)
+    if mime == "image/gif":
+        return _gif_dimensions(image_bytes)
+    if mime == "image/bmp":
+        return _bmp_dimensions(image_bytes)
+    if mime == "image/webp":
+        return _webp_dimensions(image_bytes)
+    raise ValueError("image dimensions are unavailable for this format")
+
+
+def validate_edit_mask(image_bytes: bytes, mask_bytes: bytes) -> None:
+    """Validate the standard single-image transparent-area mask contract."""
+    if detect_image_mime(mask_bytes, "") != "image/png":
+        raise ValueError("mask must be a PNG image")
+    source_width, source_height = image_dimensions(image_bytes)
+    mask_info = _png_info(mask_bytes)
+    if not mask_info["has_alpha"]:
+        raise ValueError("mask must contain an alpha channel")
+    if (source_width, source_height) != (mask_info["width"], mask_info["height"]):
+        raise ValueError("mask dimensions must match image dimensions")
 
 
 def upload_image(image_bytes: bytes, filename: str = "image.png", mime_type: str = "image/png") -> str:

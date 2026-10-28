@@ -22,7 +22,7 @@ from .gemini import (GeminiUpstreamError, generate, generate_stream, generate_im
 from .generated_image import download_generated_image
 from .tools import has_tool_call_marker, valid_tool_call_candidate, validate_tool_calls
 from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
-from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
+from .multimodal import detect_image_mime, fetch_image_bytes, upload_image, validate_edit_mask
 from .cache import CACHE
 from .rotation import rotation_worker_alive
 from . import __version__
@@ -673,6 +673,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
             prompt = _multipart_text(fields, "prompt", required=True).strip()
             image = _multipart_file(fields, "image", required=True)
             mask = _multipart_file(fields, "mask")
+            if mask is not None:
+                validate_edit_mask(image[0], mask[0])
 
             if "stream" in fields:
                 raise ValueError("stream is not supported")

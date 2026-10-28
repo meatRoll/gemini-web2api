@@ -3,9 +3,11 @@ import base64
 import io
 import json
 import os
+import struct
 import tempfile
 import threading
 import unittest
+import zlib
 from unittest import mock
 from urllib.parse import parse_qs, urlsplit
 
@@ -37,6 +39,27 @@ def _decode_sse(body):
         if event_type and data:
             events.append((event_type, json.loads(data)))
     return events
+
+
+def _png_bytes(width=2, height=2, alpha=True):
+    color_type = 6 if alpha else 2
+    pixel = b"\xff\x00\x00\xff" if alpha else b"\xff\x00\x00"
+    raw = b"".join(b"\x00" + pixel * width for _ in range(height))
+
+    def chunk(kind, data):
+        payload = kind + data
+        return (
+            struct.pack(">I", len(data)) + payload
+            + struct.pack(">I", zlib.crc32(payload) & 0xffffffff)
+        )
+
+    header = struct.pack(">IIBBBBB", width, height, 8, color_type, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", zlib.compress(raw))
+        + chunk(b"IEND", b"")
+    )
 
 
 class RotationTests(unittest.TestCase):
@@ -755,8 +778,8 @@ class StreamingEndpointTests(unittest.TestCase):
         generated = GenerationResult(
             images=[GeneratedImage("https://lh3.googleusercontent.com/edited")]
         )
-        source = b"\x89PNG\r\n\x1a\nsource"
-        mask = b"\x89PNG\r\n\x1a\nmask"
+        source = _png_bytes(2, 2, alpha=True)
+        mask = _png_bytes(2, 2, alpha=True)
         with mock.patch(
             "gemini_web2api.server.upload_image",
             side_effect=["/uploaded/source", "/uploaded/mask"],
@@ -812,6 +835,30 @@ class StreamingEndpointTests(unittest.TestCase):
         )
         self.assertEqual(status, 400)
         self.assertIn("only n=1", json.loads(body)["error"]["message"])
+
+    def test_image_edit_endpoint_rejects_mask_without_alpha(self):
+        status, _, body = self.post_multipart(
+            "/v1/images/edits",
+            fields={"prompt": "edit this"},
+            files={
+                "image": ("source.png", _png_bytes(2, 2), "image/png"),
+                "mask": ("mask.png", _png_bytes(2, 2, alpha=False), "image/png"),
+            },
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("alpha channel", json.loads(body)["error"]["message"])
+
+    def test_image_edit_endpoint_rejects_mismatched_mask_dimensions(self):
+        status, _, body = self.post_multipart(
+            "/v1/images/edits",
+            fields={"prompt": "edit this"},
+            files={
+                "image": ("source.png", _png_bytes(2, 2), "image/png"),
+                "mask": ("mask.png", _png_bytes(1, 1), "image/png"),
+            },
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("dimensions must match", json.loads(body)["error"]["message"])
 
     @mock.patch("gemini_web2api.server.generate_image_structured")
     def test_image_edit_endpoint_returns_server_owned_url_data(self, generate_image_structured):
