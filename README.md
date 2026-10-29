@@ -444,16 +444,21 @@ multiple outputs are not supported.
 The modular server also supports `POST /v1/images/edits` with OpenAI's multipart form:
 `image` and `prompt` are required, `mask` is optional, and only `n: 1` is supported.
 The source image and mask are uploaded to Gemini and sent to its dedicated image route;
-when a mask is supplied, transparent mask areas are described as the editable region.
-Images are limited to 10 MiB each. `response_format` accepts `b64_json` or `url`, and
-`url` returns a server-owned data URL. Common options such as `size`, `quality`, and
-`input_fidelity` are accepted for client compatibility but currently ignored by Gemini.
-`stream` and multiple outputs are not supported.
+when a mask is supplied, it must be a PNG with an alpha channel and the same dimensions
+as the source image. With a mask, source dimensions are currently read from PNG, JPEG, GIF, BMP,
+or WebP inputs. Transparent mask areas are described as the editable region, while
+Gemini is asked to preserve opaque areas. Gemini Web does not expose a separate mask
+parameter, so the service sends the mask as the second attachment and describes this alpha
+contract in the prompt. Images are limited to 10 MiB each. `response_format` accepts
+`b64_json` or `url`, and `url` returns a server-owned data URL. Common options such as
+`size`, `quality`, and `input_fidelity` are accepted for client compatibility but currently
+ignored by Gemini. `stream` and multiple outputs are not supported.
 
 ```bash
 curl http://localhost:8081/v1/images/edits \\
   -H "Authorization: Bearer sk-your-key" \\
   -F "image=@source.png" \\
+  -F "mask=@mask.png" \\
   -F "prompt=Replace the sky with a sunset" \\
   -F "response_format=b64_json"
 ```

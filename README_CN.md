@@ -400,15 +400,17 @@ resp = client.chat.completions.create(
 
 模块版服务还支持 OpenAI 兼容的 `POST /v1/images/edits` multipart 请求：必须提供
 `image` 和 `prompt`，可选 `mask`，只支持 `n: 1`。源图和 mask 会上传到 Gemini 并发送给专用图片路由；
-提供 mask 时，会将透明区域作为需要编辑的区域告诉 Gemini。每张图片限制为 10 MiB。
-`response_format` 支持 `b64_json` 或 `url`，其中 `url` 返回服务端生成的 data URL。为兼容客户端，
-也接受 `size`、`quality`、`input_fidelity` 等常见参数，但 Gemini 后端目前会忽略这些参数。
-不支持 `stream` 和多图输出。
+提供 mask 时，mask 必须是带 alpha 通道的 PNG，并且和源图尺寸一致。目前支持从 PNG、JPEG、GIF、BMP 或 WebP 源图读取尺寸。
+不透明区域会尽量保留。Gemini Web 没有单独的 mask 参数，因此服务会把 mask 作为第二张附件上传，
+并在提示词中说明 alpha 区域语义。每张图片限制为 10 MiB。`response_format` 支持 `b64_json` 或 `url`，其中 `url`
+返回服务端生成的 data URL。为兼容客户端，也接受 `size`、`quality`、`input_fidelity` 等常见参数，但
+Gemini 后端目前会忽略这些参数。不支持 `stream` 和多图输出。
 
 ```bash
 curl http://localhost:8081/v1/images/edits \\
   -H "Authorization: Bearer sk-your-key" \\
   -F "image=@source.png" \\
+  -F "mask=@mask.png" \\
   -F "prompt=把天空替换成日落" \\
   -F "response_format=b64_json"
 ```
