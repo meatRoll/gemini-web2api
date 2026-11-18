@@ -156,11 +156,13 @@ def _find_rpc_entry(value: Any):
         context = _nested(node, [3], None)
         refs = _nested(node, [1], [])
         content_id = _nested(node, [8], "")
+        ref = _nested(refs, [0], "") if isinstance(refs, list) and refs else ""
+        image_ref = (isinstance(ref, str)
+                     and ("image_generation_content" in ref or "image_agent_tag" in ref))
+        valid_content_id = (not isinstance(content_id, str)
+                            or not content_id or content_id.startswith("im_"))
         if (isinstance(context, list) and _nested(context, [0], None) == 22
-                and isinstance(refs, list) and refs
-                and isinstance(_nested(refs, [0], ""), str)
-                and _nested(refs, [0], "").startswith("http://googleusercontent.com/image_generation_content/")
-                and isinstance(content_id, str) and content_id.startswith("im_")):
+                and image_ref and valid_content_id):
             score = 2 if isinstance(_nested(context, [1], None), str) and _nested(context, [1], "") else 1
             if score > best_score:
                 best, best_score = node, score
@@ -169,6 +171,70 @@ def _find_rpc_entry(value: Any):
 
     visit(value)
     return best
+
+
+_IMAGE_TAG_RE = re.compile(r'<Image\b([^>]*)/?>', re.IGNORECASE)
+_IMAGE_TAG_ATTR_RE = re.compile(r'([A-Za-z0-9_-]+)\s*=\s*"([^"]*)"')
+
+
+def _image_tag_id(src: str) -> str:
+    """Return the image/content ID carried by a new-style inline Image tag."""
+    if not isinstance(src, str):
+        return ""
+    src = src.strip()
+    for prefix in ("image_agent_tag_", "image_generation_content/"):
+        if src.startswith(prefix):
+            return src[len(prefix):]
+    for marker in ("/image_agent_tag/", "/image_generation_content/"):
+        if marker in src:
+            return src.rsplit("/", 1)[-1]
+    return ""
+
+
+def _inline_image_tags(value: str) -> list:
+    """Parse new-style ``<Image .../>`` tags from Gemini text.
+
+    Gemini now renders generated images inline as either
+    ``src="image_generation_content/<id>"`` or
+    ``src="image_agent_tag_<id>"``.  The old rich-content block is not always
+    emitted for the agent variant, so keep the tag ID as a fallback.
+    """
+    if not isinstance(value, str) or "<Image" not in value:
+        return []
+    result = []
+    for match in _IMAGE_TAG_RE.finditer(value):
+        attrs = {key.lower(): item
+                 for key, item in _IMAGE_TAG_ATTR_RE.findall(match.group(1))}
+        image_id = _image_tag_id(attrs.get("src", ""))
+        if image_id:
+            result.append((image_id, attrs.get("alt", ""), attrs.get("caption", "")))
+    return result
+
+
+def _rpc_payload_for(rpc_entry: Any, image_index: int, rpc_prompt: str):
+    """Build the c8o8Fe payload metadata from a rich image record."""
+    if not isinstance(rpc_entry, list):
+        return None
+    image_metadata = _nested(rpc_entry, [0, image_index, 3], [])
+    if not isinstance(image_metadata, list) or not image_metadata:
+        image_metadata = _nested(rpc_entry, [0, 3], [])
+    signature = _nested(image_metadata, [5], "")
+    context = _nested(rpc_entry, [3], None)
+    placeholder_url = _nested(rpc_entry, [1, 0], "")
+    content_id = _nested(rpc_entry, [8], "")
+    prompt = _nested(context, [1], "") if isinstance(context, list) else ""
+    if not prompt:
+        prompt = rpc_prompt if isinstance(rpc_prompt, str) else ""
+    if not (isinstance(signature, str) and signature and isinstance(context, list)):
+        return None
+    return {
+        "signature": signature,
+        "context": context,
+        "prompt": prompt,
+        "placeholder_url": (placeholder_url
+                             if isinstance(placeholder_url, str) else ""),
+        "content_id": content_id if isinstance(content_id, str) else "",
+    }
 
 
 def extract_generation_result(raw: str, clean_text) -> GenerationResult:
@@ -186,10 +252,15 @@ def extract_generation_result(raw: str, clean_text) -> GenerationResult:
     text = ""
     images: list[GeneratedImage] = []
     seen = set()
+    tag_fallbacks = []
+    last_rpc_entry = None
+    last_rcid = ""
     cid = rid = ""
     for frame in _wrb_payloads(raw):
         rpc_prompt = _nested(frame, [0, 0, 2, 0, 0], "")
         rpc_entry = _find_rpc_entry(frame)
+        if isinstance(rpc_entry, list):
+            last_rpc_entry = rpc_entry
         metadata = _nested(frame, [1], [])
         if isinstance(metadata, list):
             cid = _nested(metadata, [0], cid) or cid
@@ -210,6 +281,10 @@ def extract_generation_result(raw: str, clean_text) -> GenerationResult:
             if isinstance(candidate_text, str) and len(candidate_text) > len(text):
                 text = candidate_text
             rcid = _nested(candidate, [0], "")
+            if isinstance(rcid, str) and rcid:
+                last_rcid = rcid
+            if isinstance(candidate_text, str) and candidate_text:
+                tag_fallbacks.extend(_inline_image_tags(candidate_text))
             rich = _nested(candidate, [12], [])
             generated_block = _jspb_field(rich, 7, [])
             entries = _nested(generated_block, [0], [])
@@ -249,29 +324,7 @@ def extract_generation_result(raw: str, clean_text) -> GenerationResult:
                     alt = _nested(image_entry, [0, 3, 2], "")
                     if not isinstance(alt, str) or not alt:
                         alt = _nested(image_entry, [3, 2], "")
-                    rpc_payload = None
-                    if isinstance(rpc_entry, list):
-                        image_metadata = _nested(rpc_entry, [0, image_index, 3], [])
-                        if not isinstance(image_metadata, list) or not image_metadata:
-                            image_metadata = _nested(rpc_entry, [0, 3], [])
-                        signature = _nested(image_metadata, [5], "")
-                        context = _nested(rpc_entry, [3], None)
-                        placeholder_url = _nested(rpc_entry, [1, 0], "")
-                        content_id = _nested(rpc_entry, [8], "")
-                        prompt = _nested(context, [1], "") if isinstance(context, list) else ""
-                        if not prompt:
-                            prompt = rpc_prompt if isinstance(rpc_prompt, str) else ""
-                        if (isinstance(signature, str) and signature
-                                and isinstance(context, list)):
-                            rpc_payload = {
-                                "signature": signature,
-                                "context": context,
-                                "prompt": prompt,
-                                "placeholder_url": (placeholder_url
-                                                     if isinstance(placeholder_url, str)
-                                                     else ""),
-                                "content_id": content_id if isinstance(content_id, str) else "",
-                            }
+                    rpc_payload = _rpc_payload_for(rpc_entry, image_index, rpc_prompt)
                     images.append(GeneratedImage(
                         url=url, alt=alt if isinstance(alt, str) else "",
                         image_id=image_id,
@@ -280,6 +333,32 @@ def extract_generation_result(raw: str, clean_text) -> GenerationResult:
                         rcid=rcid if isinstance(rcid, str) else "",
                         rpc_payload=rpc_payload,
                     ))
+
+    # Newer Gemini responses can describe the image only through an inline
+    # ``<Image ... src="image_agent_tag_<id>"/>`` tag, without the rich-content
+    # URL.  Keep the tag ID and the c8o8Fe signature/context so the caller can
+    # mint a full-size URL through the existing RPC.
+    if not images and tag_fallbacks:
+        tag_fallbacks.extend(_inline_image_tags(text))
+        seen_tags = set()
+        for tag_id, alt, caption in tag_fallbacks:
+            if not tag_id or tag_id in seen_tags:
+                continue
+            seen_tags.add(tag_id)
+            image_id = (_nested(last_rpc_entry, [9], "")
+                        if isinstance(last_rpc_entry, list) else "")
+            if not isinstance(image_id, str) or not image_id:
+                image_id = tag_id
+            rpc_payload = _rpc_payload_for(last_rpc_entry, 0, "")
+            _diagnostic_log("extract_tag_fallback id=%s has_payload=%s" % (
+                str(image_id)[:16], bool(rpc_payload)))
+            images.append(GeneratedImage(
+                url="", alt=alt or caption or "", image_id=image_id,
+                cid=cid if isinstance(cid, str) else "",
+                rid=rid if isinstance(rid, str) else "",
+                rcid=last_rcid if isinstance(last_rcid, str) else "",
+                rpc_payload=rpc_payload,
+            ))
     return GenerationResult(text=clean_text(text), images=images, raw=raw)
 
 
